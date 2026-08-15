@@ -97,6 +97,7 @@ echo $result->lastInsertId();   // 1
 | [写入（DML）](docs/write.md) | INSERT/UPDATE/DELETE、约束行为、级联删除 |
 | [事务](docs/transactions.md) | 快照语义、DDL 回滚、限制 |
 | [架构与扩展](docs/architecture.md) | 分层设计、存储引擎、异常体系、自定义引擎 |
+| [路线图](docs/roadmap.md) | 迭代计划、与完整 SQL 的差距矩阵、技术债 |
 
 ## 目录结构
 
