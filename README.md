@@ -41,11 +41,12 @@ foreach ($rows as $row) {
 ## 特性
 
 - **MySQL 风格类型系统**：TINYINT/SMALLINT/INT/BIGINT（含 UNSIGNED）、DECIMAL(M,D)、FLOAT/DOUBLE、BOOLEAN、CHAR/VARCHAR/TEXT、ENUM、DATE/DATETIME/TIMESTAMP，写入时严格校验与规范化
-- **完整约束**：主键、自增、NOT NULL、DEFAULT / CURRENT_TIMESTAMP、单列与联合唯一、外键（RESTRICT / ON DELETE CASCADE 级联删除）
-- **链式查询**：WHERE 嵌套分组、INNER/LEFT/RIGHT JOIN、GROUP BY + HAVING、COUNT/SUM/AVG/MIN/MAX 聚合、ORDER BY、LIMIT/OFFSET、DISTINCT、LIKE 通配
+- **完整约束**：主键（单列与复合）、自增、NOT NULL、DEFAULT / CURRENT_TIMESTAMP、单列与联合唯一、外键（DELETE/UPDATE 各四策略）、CHECK 约束；文件引擎带目录级多进程锁
+- **链式查询**：WHERE 嵌套分组、子查询（IN/EXISTS）、UNION / UNION ALL、CASE 与函数表达式、列级 collation（ci）、INNER/LEFT/RIGHT JOIN、GROUP BY + HAVING、COUNT/SUM/AVG/MIN/MAX 聚合、ORDER BY、LIMIT/OFFSET、DISTINCT、LIKE 通配
+- **二级索引与 hash join 加速**：等值查询走哈希索引预过滤（主键/唯一约束列自动可用作索引），等值 JOIN 走哈希构建+探测；未命中自动回退全扫描，结果一致
 - **NULL 三值逻辑**：与 SQL 一致——NULL 参与比较结果为未知（行被过滤），仅 `IS NULL` / `IS NOT NULL` 可匹配
 - **事务**：`begin()/commit()/rollBack()`，快照隔离实现，支持回滚 DDL
-- **可插拔存储引擎**：内置 MemoryEngine（纯内存）与 JsonFileEngine（文件持久化、原子写入），可实现 `StorageEngine` 接口自定义
+- **可插拔存储引擎**：MemoryEngine（纯内存）、JsonFileEngine（可读文件）、PhpSerializeEngine（高性能文件）、PagedJsonEngine（分页增量 + 墓碑删除），可实现 `StorageEngine` 接口自定义
 - **异常驱动**：任何失败（类型不合法、约束冲突、IO 损坏、误用）一律抛异常，绝不静默吞错；全库 `declare(strict_types=1)`
 
 ## 环境要求
@@ -109,9 +110,9 @@ src/
 ├── Schema/                   # Blueprint 建表 DSL、TableSchema、外键定义
 ├── Type/                     # ValueCaster 值校验与规范化
 ├── Query/                    # Table/SelectBuilder 链式构建、条件树、Agg
-├── Execution/                # Writer 约束管线、Executor 查询流水线
+├── Execution/                # Writer 约束管线、Executor 查询流水线、IndexManager 索引
 ├── Result/                   # ResultSet、InsertResult
-└── Storage/                  # StorageEngine 接口、Memory/JsonFile 实现
+└── Storage/                  # StorageEngine 接口、Memory/JsonFile/PhpSerialize/PagedJson 引擎、目录锁
 ```
 
 ## 测试
@@ -120,7 +121,7 @@ src/
 composer test
 ```
 
-288 项单元/集成测试，覆盖类型、约束、DDL、DML、事务、持久化六大体系。
+683 项单元/集成测试，覆盖类型、约束、DDL、DML、事务、持久化、索引、子查询/UNION/表达式、并发锁等体系。
 
 ## License
 

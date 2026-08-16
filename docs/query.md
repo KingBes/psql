@@ -21,6 +21,78 @@ $rows = $db->table('user as u')
 - 输出行是 `array<string, mixed>`，键为**去限定列名**（`u.id` 输出键为 `id`）
 - 两个不同源的列解析出相同输出键时抛 `QueryException`（用别名限定避免）
 
+## 表达式与函数
+
+`select()` 投影除了列名与 `Agg` 聚合，还接受标量函数表达式与 CASE 表达式（统一实现 `Query\ProjectionExpression` 接口，对源行求值）。
+
+### 标量函数（Func）
+
+```php
+use Kingbes\Psql\Query\Func;
+
+$rows = $db->table('user')
+    ->select('id', Func::upper(Func::col('name'))->as('name_upper'))
+    ->get();
+```
+
+`Func::col('name')` 为列引用（裸列名或 `alias.col` 限定名），供函数/CASE 嵌套取行内列值。全部函数：
+
+| 分类 | 函数 | 说明 |
+|---|---|---|
+| 字符串 | `Func::upper(x)` / `Func::lower(x)` | 转大写 / 转小写 |
+| | `Func::length(x)` | 字符串长度（按字符，mb） |
+| | `Func::trim(x)` / `Func::ltrim(x)` / `Func::rtrim(x)` | 去两端 / 左 / 右空白 |
+| | `Func::substr(x, pos, len?)` | 子串截取，**pos 1 基**；len 缺省截到串尾 |
+| | `Func::concat(a, b, ...)` | 拼接（至少 1 个参数） |
+| | `Func::replace(s, search, replace)` | search 出现处全部替换 |
+| 数学 | `Func::abs(x)` / `Func::round(x, digits?)` / `Func::floor(x)` / `Func::ceil(x)` | round 的 digits 默认 0 |
+| 日期 | `Func::year(x)` / `Func::month(x)` / `Func::day(x)` | 入参须合法 `Y-m-d [H:i:s]`（含 checkdate 校验） |
+| 控制 | `Func::coalesce(a, b, ...)` | 第一个非 null 参数，全 null 返回 null |
+| | `Func::nullif(a, b)` | a = b 返回 null，否则返回 a |
+
+- 参数均接受标量/null 或嵌套表达式，任意组合：`Func::concat(Func::upper(Func::col('a')), '_', Func::col('b'))`
+- **NULL 传播**（与 SQL 一致）：任一参数为 null 时函数返回 null，唯一例外是 `coalesce`
+- 非数值入参进数学函数、非法日期进日期函数、越界参数（如 substr 的 pos/len）抛 `QueryException`
+- 输出键默认为函数形式（如 `UPPER(name)`），`->as('别名')` 自定义
+
+### CASE 表达式（CaseWhen）
+
+```php
+use Kingbes\Psql\Query\CaseWhen;
+
+$rows = $db->table('user')
+    ->select('name', CaseWhen::make()
+        ->when('age', '>=', 18)->then('成年')
+        ->when('age', '<', 18)->then('未成年')
+        ->else('未知')
+        ->as('label'))
+    ->get();
+```
+
+- `when` 参数形式同 `where`：`(列, 值)` 等值 / `(列, 运算符, 值)` 显式指定
+- 分支依序求值，**命中即返回**对应 `then`；全不中取 `else` 值，未设 `else` 返回 null
+- `then` / `else` 可嵌套表达式：`->then(Func::upper(Func::col('name')))`
+- 连续 `when` 未 `then`（或 `then` 不紧跟 `when`）抛 `QueryException`
+- 默认输出键恒为 `CASE`，多个 CASE 并用时建议都起别名
+
+### 投影组合
+
+表达式与聚合一样作为投影参与分组/过滤/排序，别名可被 `orderBy` / `having` / `groupBy` 引用：
+
+```php
+$rows = $db->table('user')
+    ->select(
+        Func::substr(Func::col('name'), 1, 1)->as('initial'),
+        CaseWhen::make()
+            ->when('vip', 1)->then('会员')->else('普通')
+            ->as('kind'),
+    )
+    ->groupBy('initial', 'kind')
+    ->having('kind', '会员')
+    ->orderBy('initial')
+    ->get();
+```
+
 ## WHERE 条件
 
 ### 基本形式
@@ -60,12 +132,13 @@ $group = (new ConditionGroup())
     ->orWhere('vip', 1);
 
 $rows = $db->table('user')
-    ->where('status', 'active')   // status = 'active'
-    ->whereGroup($group)          // AND ( age < 18 OR vip = 1 )
+    ->where('status', 'active')    // status = 'active'
+    ->whereGroup($group)           // AND ( age < 18 OR vip = 1 )
+    ->orWhereGroup($group)         // OR  ( age < 18 OR vip = 1 )，与 whereGroup 对称
     ->get();
 ```
 
-`ConditionGroup` 拥有与构建器一致的 where 系列 API，可任意嵌套实现 `(...) AND (...)` 等复杂逻辑，经 `whereGroup()` 以 AND 语义挂进查询。
+`ConditionGroup` 拥有与构建器一致的 where 系列 API，可任意嵌套实现 `(...) AND (...)` 等复杂逻辑，经 `whereGroup()`（AND 语义）或 `orWhereGroup()`（OR 语义）挂进查询。
 
 ### NULL 三值逻辑（与 SQL 一致）
 
@@ -76,6 +149,75 @@ $rows = $db->table('user')
 ### LIKE 通配
 
 `%` 任意字符串、`_` 单个字符，反斜杠 `\` 转义（`\%`、`\_`、`\\`），大小写敏感。
+
+把用户输入按**字面量**匹配时，用 `Kingbes\Psql\Query\Like::escape()` 转义输入中的 `%`、`_`、`\`：
+
+```php
+use Kingbes\Psql\Query\Like;
+
+// 用户输入 "100%" 中的 % 不会被当通配符
+$pattern = '%' . Like::escape($input) . '%';
+$db->table('post')->whereLike('title', $pattern)->get();
+```
+
+## 子查询
+
+`whereIn` / `whereNotIn` 除了数组，还接受另一个查询构建器（传数组时行为不变）：
+
+```php
+$sub = $db->table('order')->select('user_id')->where('amount', '>', 100);
+
+$rows = $db->table('user')
+    ->whereIn('id', $sub)              // id IN (SELECT user_id FROM order WHERE ...)
+    ->get();
+
+$db->table('user')->whereExists($sub);        // EXISTS (SELECT ...)
+$db->table('user')->whereNotExists($sub);     // NOT EXISTS (SELECT ...)
+```
+
+- 子查询必须**恰好 1 个输出列**（多了/少了抛 `QueryException`）
+- 子查询作为独立查询**完整执行**（含自身的 orderBy / limit / union），结果集参与 IN / EXISTS 判定
+- 支持多层嵌套——子查询里再套子查询
+- UPDATE / DELETE 的 where 同样支持子查询（见[写入文档](write.md)）
+- CHECK 约束条件中**禁止子查询**（注册时抛 `SchemaException`）
+- 不支持相关子查询——引用外层别名的列会按未知列抛 `QueryException`
+
+## 索引加速
+
+等值查询可自动走哈希二级索引预过滤——无需改写查询代码，命中即加速，未命中自动回退全表扫描，结果完全一致。
+
+### 建立与删除索引
+
+```php
+$db->createIndex('user', 'idx_email', 'email');              // 单列
+$db->createIndex('user', 'idx_dept_role', 'dept', 'role');   // 多列复合
+$db->hasIndex('user', 'idx_email');                          // bool
+$db->dropIndex('user', 'idx_email');
+```
+
+建表时也可用 Blueprint DSL（自动命名 `idx_<列连接>`，详见[类型文档](types-and-ddl.md#二级索引)）：
+
+```php
+$t->index('email');            // idx_email
+$t->index('dept', 'role');     // idx_dept_role
+```
+
+### 自动可用的索引（无需显式建）
+
+**主键列（含复合主键的全部列）、单列 UNIQUE 约束列、联合唯一组**自动可用作索引。`Table::find()` 走主键等值查找，天然受益。
+
+### 触发条件与回退
+
+同时满足以下条件时走哈希预过滤：
+
+- WHERE 顶层条件全部为 **AND 连接的等值比较**（裸列名、值非 null）
+- 参与比较的**列集与某可用索引完全一致**（顺序不敏感；如索引 `(dept, role)` 需要 dept、role 两列都有等值条件）
+
+范围比较（`>` `<` `between` 等）、OR、`whereIn`、`whereLike`、嵌套分组等自动回退全表扫描。索引命中仅做候选行预过滤，候选行仍完整求值原 WHERE——**结果与全表扫描完全一致**。
+
+### 缓存失效
+
+索引哈希缓存在连接级维护；任何写操作、DDL、事务回滚后自动失效重建，无需手动管理。性能参考：5 万行等值查询热查 ~0.02ms vs 全扫描 ~100ms。
 
 ## JOIN
 
@@ -125,6 +267,23 @@ $rows = $db->table('user')
 - 排序键先在输出列中找，找不到回退源行限定列；null 视为最小
 - limit/offset 不允许负数
 
+## UNION / UNION ALL
+
+```php
+$rows = $db->table('student')->select('name', 'age')->where('age', '>=', 18)
+    ->union($db->table('teacher')->select('name', 'age'))
+    ->unionAll($db->table('staff')->select('name', 'age'))
+    ->orderBy('age', 'DESC')
+    ->limit(10)
+    ->get();
+```
+
+- 多方可链式追加，`union` / `unionAll` 可交替混用
+- 每个 SELECT **完整独立执行**（含自身排序 / limit）后按声明顺序合并
+- `union` 对合并全集去重并保持首见顺序；`unionAll` 保留重复行
+- 各方输出列**键集必须一致**（不一致抛 `QueryException`；某方结果为空时跳过该方校验）
+- 合并后外层的 `distinct()` / `orderBy` / `limit` / `offset` 作用于合并结果
+
 ## 结果集 ResultSet
 
 `get()` 返回 `Kingbes\Psql\Result\ResultSet`：
@@ -161,7 +320,42 @@ $db->table('user')->max('age');       // mixed（空表抛 QueryException）
 $db->table('user')->find(1);   // ?array；表无主键抛 QueryException
 ```
 
+仅适用单列主键表——复合主键表调用同样抛"无主键"`QueryException`。
+
+## 分批与惰性
+
+### chunk 分批处理
+
+```php
+$processed = $db->table('user')
+    ->where('age', '>', 18)
+    ->orderBy('id')
+    ->chunk(100, function (array $rows, int $iteration): bool {
+        // $rows：本批行（list<array<string,mixed>>），至多 100 行
+        // $iteration：当前批次序号（从 1 起）
+        foreach ($rows as $row) {
+            // 逐行处理
+        }
+        return true;    // 返回 false 提前终止后续批次
+    });
+// $processed：已处理的总行数（int）
+```
+
+- 内部用 LIMIT/OFFSET 分页实现，与 `where` / `orderBy` / 聚合等链式条件自然组合
+- `size < 1`、或与 `limit`/`offset` 同用抛 `QueryException`
+
+### cursor 惰性游标
+
+```php
+foreach ($db->table('user')->where('vip', 1)->cursor() as $row) {
+    // ...
+}
+```
+
+`cursor(): \Generator`——生成器函数体在**首次迭代时**才执行查询（定义时不查）。注意：数据仍会被引擎整体读入内存，惰性的是查询执行时机而非内存占用。
+
 ## 比较/排序规则
 
 - 两侧均为"数值性"（int/float/纯数字字符串）→ 按数值比较（`'10' > '9'` 成立）
 - 否则按字符串比较，**区分大小写**
+- 列声明 `ci()` 修饰符后，涉该列的比较与排序（含 JOIN ON、UPDATE/DELETE 的 where）折叠大小写，详见[类型文档的 collation 说明](types-and-ddl.md#collation列级-ci)

@@ -16,13 +16,140 @@ final readonly class TableSchema
      * @param list<ColumnSchema> $columns
      * @param list<list<string>> $uniqueKeys 联合唯一
      * @param list<ForeignKey> $foreignKeys
+     * @param list<CheckConstraint> $checks CHECK 约束
+     * @param list<TableIndex> $indexes 二级索引
      */
     public function __construct(
         public string $name,
         public array $columns,
         public array $uniqueKeys = [],
         public array $foreignKeys = [],
+        public array $checks = [],
+        public array $indexes = [],
     ) {
+        $this->assertCheckNamesUnique();
+        $this->assertForeignKeyActionColumns();
+        $this->assertIndexesValid();
+        $this->assertAutoIncrementPrimaryKey();
+    }
+
+    /**
+     * 校验自增列与主键的关系：自增列存在时主键必须恰好为该单列
+     * （v1 限制：复合主键不支持自增列）；违反抛 SchemaException（消息含表/列名）
+     */
+    private function assertAutoIncrementPrimaryKey(): void
+    {
+        $autoIncrement = null;
+        foreach ($this->columns as $column) {
+            if ($column->autoIncrement) {
+                $autoIncrement = $column;
+                break;
+            }
+        }
+        if ($autoIncrement === null) {
+            return;
+        }
+        $primaryKeyColumns = $this->primaryKeyColumns();
+        if (count($primaryKeyColumns) === 1 && $primaryKeyColumns[0] === $autoIncrement) {
+            return;
+        }
+
+        throw new SchemaException(
+            "表 {$this->name} 自增列 {$autoIncrement->name} 必须恰好为唯一的主键列"
+            . '（v1 限制：复合主键不支持自增列）'
+        );
+    }
+
+    /**
+     * 校验 CHECK 约束名唯一；重名抛 SchemaException（消息含两个冲突名）
+     */
+    private function assertCheckNamesUnique(): void
+    {
+        $names = [];
+        foreach ($this->checks as $check) {
+            if (in_array($check->name, $names, true)) {
+                $existing = array_search($check->name, $names, true);
+
+                throw new SchemaException(
+                    "表 {$this->name} CHECK 约束名重复: {$names[$existing]} 与 {$check->name}"
+                );
+            }
+            $names[] = $check->name;
+        }
+    }
+
+    /**
+     * 校验外键策略对列的要求：SET_NULL 需列可空，SET_DEFAULT 需列有默认值；
+     * 违反抛 SchemaException（消息含表/列/策略名）。createTable/alterTable/fromArray 路径统一触发。
+     */
+    private function assertForeignKeyActionColumns(): void
+    {
+        foreach ($this->foreignKeys as $foreignKey) {
+            $column = null;
+            foreach ($this->columns as $item) {
+                if ($item->name === $foreignKey->column) {
+                    $column = $item;
+                    break;
+                }
+            }
+            if ($column === null) {
+                continue;
+            }
+            foreach ([$foreignKey->onDelete, $foreignKey->onUpdate] as $action) {
+                if ($action === ForeignKeyAction::SET_NULL && $column->notNull) {
+                    throw new SchemaException(
+                        "表 {$this->name} 列 {$foreignKey->column} 为 NOT NULL，"
+                        . '外键策略 SET_NULL 要求该列可空'
+                    );
+                }
+                if ($action === ForeignKeyAction::SET_DEFAULT && !$column->hasDefault) {
+                    throw new SchemaException(
+                        "表 {$this->name} 列 {$foreignKey->column} 无默认值，"
+                        . '外键策略 SET_DEFAULT 要求该列有默认值'
+                    );
+                }
+            }
+        }
+    }
+
+    /**
+     * 校验索引列表：实例类型、索引名唯一、列存在且索引内不重复；
+     * 违反抛 SchemaException（消息含索引名/列名）
+     */
+    private function assertIndexesValid(): void
+    {
+        $names = [];
+        foreach ($this->indexes as $index) {
+            if (!$index instanceof TableIndex) {
+                throw new SchemaException("表 {$this->name} 的索引实例必须为 TableIndex");
+            }
+            if (in_array($index->name, $names, true)) {
+                $existing = array_search($index->name, $names, true);
+
+                throw new SchemaException(
+                    "表 {$this->name} 索引名重复: {$names[$existing]} 与 {$index->name}"
+                );
+            }
+            $names[] = $index->name;
+
+            if ($index->columns === []) {
+                throw new SchemaException("表 {$this->name} 索引 {$index->name} 未定义任何列");
+            }
+            $seen = [];
+            foreach ($index->columns as $column) {
+                if (in_array($column, $seen, true)) {
+                    throw new SchemaException(
+                        "表 {$this->name} 索引 {$index->name} 存在重复列: {$column}"
+                    );
+                }
+                $seen[] = $column;
+                if (!$this->hasColumn($column)) {
+                    throw new SchemaException(
+                        "表 {$this->name} 索引 {$index->name} 引用了不存在的列: {$column}"
+                    );
+                }
+            }
+        }
     }
 
     /**
@@ -54,17 +181,38 @@ final readonly class TableSchema
     }
 
     /**
-     * 主键列，无主键返回 null（合法）
+     * 单列语义的主键列：恰好一个主键列时返回它，0 个或复合主键（>=2 个）返回 null
      */
     public function primaryKey(): ?ColumnSchema
     {
+        $found = null;
         foreach ($this->columns as $column) {
             if ($column->primaryKey) {
-                return $column;
+                if ($found !== null) {
+                    return null;
+                }
+                $found = $column;
             }
         }
 
-        return null;
+        return $found;
+    }
+
+    /**
+     * 全部主键列（保持列定义顺序）；无主键返回空列表
+     *
+     * @return list<ColumnSchema>
+     */
+    public function primaryKeyColumns(): array
+    {
+        $result = [];
+        foreach ($this->columns as $column) {
+            if ($column->primaryKey) {
+                $result[] = $column;
+            }
+        }
+
+        return $result;
     }
 
     /**
@@ -110,7 +258,14 @@ final readonly class TableSchema
      */
     public function withName(string $name): self
     {
-        return new self($name, $this->columns, $this->uniqueKeys, $this->foreignKeys);
+        return new self(
+            $name,
+            $this->columns,
+            $this->uniqueKeys,
+            $this->foreignKeys,
+            $this->checks,
+            $this->indexes,
+        );
     }
 
     /**
@@ -135,7 +290,14 @@ final readonly class TableSchema
             throw new SchemaException("待替换的列不存在: {$new->name}");
         }
 
-        return new self($this->name, $columns, $this->uniqueKeys, $this->foreignKeys);
+        return new self(
+            $this->name,
+            $columns,
+            $this->uniqueKeys,
+            $this->foreignKeys,
+            $this->checks,
+            $this->indexes,
+        );
     }
 
     /**
@@ -166,6 +328,20 @@ final readonly class TableSchema
                 throw new SchemaException("列 {$name} 参与外键约束，不允许删除");
             }
         }
+        foreach ($this->checks as $check) {
+            if ($check->referencesColumn($name)) {
+                throw new SchemaException(
+                    "列 {$name} 被 CHECK 约束 {$check->name} 引用，不允许删除"
+                );
+            }
+        }
+        foreach ($this->indexes as $index) {
+            if ($index->referencesColumn($name)) {
+                throw new SchemaException(
+                    "列 {$name} 被索引 {$index->name} 引用，不允许删除"
+                );
+            }
+        }
 
         $columns = array_values(
             array_filter(
@@ -174,7 +350,14 @@ final readonly class TableSchema
             ),
         );
 
-        return new self($this->name, $columns, $this->uniqueKeys, $this->foreignKeys);
+        return new self(
+            $this->name,
+            $columns,
+            $this->uniqueKeys,
+            $this->foreignKeys,
+            $this->checks,
+            $this->indexes,
+        );
     }
 
     /**
@@ -204,12 +387,26 @@ final readonly class TableSchema
         );
         $foreignKeys = array_map(
             static fn (ForeignKey $foreignKey): ForeignKey => $foreignKey->column === $from
-                ? new ForeignKey($to, $foreignKey->refTable, $foreignKey->refColumn, $foreignKey->onDeleteCascade)
+                ? new ForeignKey(
+                    $to,
+                    $foreignKey->refTable,
+                    $foreignKey->refColumn,
+                    $foreignKey->onDelete,
+                    $foreignKey->onUpdate,
+                )
                 : $foreignKey,
             $this->foreignKeys,
         );
+        $checks = array_map(
+            static fn (CheckConstraint $check): CheckConstraint => $check->withColumnRenamed($from, $to),
+            $this->checks,
+        );
+        $indexes = array_map(
+            static fn (TableIndex $index): TableIndex => $index->withColumnRenamed($from, $to),
+            $this->indexes,
+        );
 
-        return new self($this->name, $columns, $uniqueKeys, $foreignKeys);
+        return new self($this->name, $columns, $uniqueKeys, $foreignKeys, $checks, $indexes);
     }
 
     /**
@@ -229,6 +426,14 @@ final readonly class TableSchema
             'foreignKeys' => array_map(
                 static fn (ForeignKey $foreignKey): array => $foreignKey->toArray(),
                 $this->foreignKeys,
+            ),
+            'checks' => array_map(
+                static fn (CheckConstraint $check): array => $check->toArray(),
+                $this->checks,
+            ),
+            'indexes' => array_map(
+                static fn (TableIndex $index): array => $index->toArray(),
+                $this->indexes,
             ),
         ];
     }
@@ -284,6 +489,34 @@ final readonly class TableSchema
             $foreignKeys[] = ForeignKey::fromArray($item);
         }
 
-        return new self($name, $columns, $uniqueKeys, $foreignKeys);
+        // 旧数据无 checks 键视为空列表
+        $checksRaw = $data['checks'] ?? [];
+        if (!is_array($checksRaw)) {
+            throw new StorageException("表 {$name} 的 checks 必须为数组");
+        }
+        $checks = [];
+        foreach ($checksRaw as $item) {
+            if (!is_array($item)) {
+                throw new StorageException("表 {$name} 的 CHECK 约束定义必须为数组");
+            }
+            $checks[] = CheckConstraint::fromArray($item);
+        }
+
+        // 旧数据无 indexes 键或为 null 视为空列表
+        $indexesRaw = $data['indexes'] ?? null;
+        $indexes = [];
+        if ($indexesRaw !== null) {
+            if (!is_array($indexesRaw)) {
+                throw new StorageException("表 {$name} 的 indexes 必须为数组");
+            }
+            foreach ($indexesRaw as $item) {
+                if (!is_array($item)) {
+                    throw new StorageException("表 {$name} 的索引定义必须为数组");
+                }
+                $indexes[] = TableIndex::fromArray($item);
+            }
+        }
+
+        return new self($name, $columns, $uniqueKeys, $foreignKeys, $checks, $indexes);
     }
 }

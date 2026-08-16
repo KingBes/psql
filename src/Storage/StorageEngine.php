@@ -77,6 +77,15 @@ interface StorageEngine
     public function writeRows(string $database, string $table, array $rows): void;
 
     /**
+     * 按稠密行序号删除行（0 基，序号指 readRows 返回的可见行序列）；
+     * indices 为空 no-op；任一序号越界（<0 或 >= 当前行数）抛 StorageException；
+     * 重复序号抛 StorageException；库/表不存在照既有约定抛
+     *
+     * @param list<int> $indices
+     */
+    public function deleteRows(string $database, string $table, array $indices): void;
+
+    /**
      * 当前已分配的最大自增值（初始 0）；表不存在抛 StorageException
      */
     public function autoIncrement(string $database, string $table): int;

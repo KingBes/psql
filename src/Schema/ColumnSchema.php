@@ -14,6 +14,7 @@ final readonly class ColumnSchema
     /**
      * @param list<string>|null $enumValues ENUM 成员
      * @param mixed $default 默认值（hasDefault 为 true 时有效）
+     * @param bool $ci 大小写不敏感 collation（仅影响查询比较与排序；约束/唯一/外键/索引构建/CHECK 保持区分大小写）
      */
     public function __construct(
         public string $name,
@@ -30,6 +31,7 @@ final readonly class ColumnSchema
         public mixed $default = null,
         public bool $defaultNow = false,
         public ?array $enumValues = null,
+        public bool $ci = false,
     ) {
     }
 
@@ -53,6 +55,7 @@ final readonly class ColumnSchema
             $this->default,
             $this->defaultNow,
             $this->enumValues,
+            $this->ci,
         );
     }
 
@@ -78,6 +81,7 @@ final readonly class ColumnSchema
             'default' => $this->default,
             'defaultNow' => $this->defaultNow,
             'enumValues' => $this->enumValues,
+            'ci' => $this->ci,
         ];
     }
 
@@ -127,6 +131,7 @@ final readonly class ColumnSchema
             default: $data['default'] ?? null,
             defaultNow: (bool) ($data['defaultNow'] ?? false),
             enumValues: $enumValues === null ? null : array_values($enumValues),
+            ci: (bool) ($data['ci'] ?? false),
         );
     }
 

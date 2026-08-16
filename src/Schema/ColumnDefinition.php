@@ -19,6 +19,7 @@ final class ColumnDefinition
     private bool $unique = false;
     private bool $primaryKey = false;
     private bool $autoIncrement = false;
+    private bool $ci = false;
 
     /**
      * @param list<string>|null $enumValues
@@ -117,6 +118,19 @@ final class ColumnDefinition
     }
 
     /**
+     * 大小写不敏感 collation（仅影响查询比较与排序；约束/唯一/外键/索引构建/CHECK 保持区分大小写）
+     */
+    public function ci(): static
+    {
+        if (!$this->type->isString() && $this->type !== DataType::ENUM) {
+            throw new SchemaException("列 {$this->name} 类型 {$this->type->value} 不支持 ci");
+        }
+        $this->ci = true;
+
+        return $this;
+    }
+
+    /**
      * 列名
      */
     public function name(): string
@@ -144,6 +158,7 @@ final class ColumnDefinition
             $this->default,
             $this->defaultNow,
             $this->enumValues,
+            $this->ci,
         );
     }
 }

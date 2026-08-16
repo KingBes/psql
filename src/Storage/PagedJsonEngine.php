@@ -11,8 +11,16 @@ use Kingbes\Psql\Schema\TableSchema;
  * 分页增量 JSON 存储引擎：表数据按 pageSize 切页存储，单次写盘只重写受影响页
  *
  * 磁盘布局：
- * - meta：<root>/<数据库>/<表>.meta.json —— 结构 / 自增值 / 页大小 / 每页代数列表（唯一事实源）
+ * - meta：<root>/<数据库>/<表>.meta.json —— 结构 / 自增值 / 页大小 / 每页代数列表 / 死槽计数（唯一事实源）
  * - 页  ：<root>/<数据库>/<表>.<页号>.<代数>.page.json —— 页内行数组（尾部页可不满）
+ *
+ * 墓碑模型（v1.2）：内部行存储为槽位序列 slots（list<array|null>），删除只把所在槽位置 null（墓碑）
+ * 并重写该槽位所在页，页槽位总数不变；对外 readRows 恒过滤 null 返回稠密 list（引擎外部视角不变）。
+ * 死槽比例或绝对数超阈值（deleteRows 路径）或全量 writeRows 时执行压实（compaction）：丢弃墓碑、
+ * 全部页按稠密行重排、dead 归零。
+ *
+ * 关键不变量：任何时刻 meta.pages 指向的页文件拼接（含 null）总槽位数 = pages 数 × page_size
+ * （末页可不满）且 meta.dead = 其中 null 槽位数。
  *
  * 崩溃安全模型：先写新代数页文件（各自 tmp+rename），再原子提交 meta，最后清理旧代数页与孤儿文件。
  * meta 未变时新页皆为孤儿（加载时清理）；meta 已变时新页必已全部落盘。
@@ -23,10 +31,16 @@ final class PagedJsonEngine implements StorageEngine
 
     private const META_EXT = '.meta.json';
 
+    /** 压实阈值：死槽绝对数下限（避免小表频繁全量重排） */
+    private const COMPACT_MIN_DEAD = 100;
+
+    /** 压实阈值：死槽占总槽位数比例下限 */
+    private const COMPACT_RATIO = 0.4;
+
     /**
      * 运行时事实源：库 => 表 => 条目
      *
-     * @var array<string, array<string, array{schema: TableSchema, rows: list<array<string,mixed>>, ai: int, pages: list<int>, page_size: int, loaded: bool}>>
+     * @var array<string, array<string, array{schema: TableSchema, slots: list<array<string,mixed>|null>, ai: int, pages: list<int>, page_size: int, dead: int, loaded: bool}>>
      */
     private array $cache = [];
 
@@ -45,6 +59,12 @@ final class PagedJsonEngine implements StorageEngine
         if (!is_writable($this->root)) {
             throw new StorageException("根目录不可写: {$this->root}");
         }
+        DirectoryLock::acquire($this->root);
+    }
+
+    public function __destruct()
+    {
+        DirectoryLock::release($this->root);
     }
 
     public function databases(): array
@@ -153,10 +173,11 @@ final class PagedJsonEngine implements StorageEngine
 
         $entry = [
             'schema' => $schema,
-            'rows' => [],
+            'slots' => [],
             'ai' => 0,
             'pages' => [],
             'page_size' => $this->pageSize,
+            'dead' => 0,
             'loaded' => true,
         ];
         $this->cache[$database][$schema->name] = $entry;
@@ -239,14 +260,25 @@ final class PagedJsonEngine implements StorageEngine
 
     public function readRows(string $database, string $table): array
     {
-        return $this->tableEntry($database, $table)['rows'];
+        $slots = $this->tableEntry($database, $table)['slots'];
+        // 过滤墓碑槽位：对外恒为稠密 list（引擎外部视角不变）
+        return array_values(array_filter($slots, static fn ($slot): bool => $slot !== null));
     }
 
     public function writeRows(string $database, string $table, array $rows): void
     {
         $entry = $this->tableEntry($database, $table);
         $rows = array_values($rows);
-        $oldRows = $entry['rows'];
+
+        if ($entry['dead'] > 0) {
+            // 存在墓碑：全量重排（丢弃墓碑，slots=新行稠密，全部页重建，dead 归零）
+            $this->rewriteDense($database, $table, $entry, $rows);
+            return;
+        }
+
+        // dead == 0：slots 即稠密行（无 null），走既有逐页 diff 路径（保持 v1.1 增量行为：
+        // append / 原地更新依旧只脏所在页；行数变化的 suffix diff 保守重写）
+        $oldRows = $entry['slots'];
         $oldCount = count($oldRows);
         $newCount = count($rows);
 
@@ -310,7 +342,7 @@ final class PagedJsonEngine implements StorageEngine
         }
 
         // b. meta 提交（提交点）：行数据以 meta.pages 指引的页文件拼接为准
-        $entry['rows'] = $rows;
+        $entry['slots'] = $rows;
         $entry['pages'] = $newPages;
         $this->writeMeta($database, $table, $entry);
 
@@ -323,6 +355,125 @@ final class PagedJsonEngine implements StorageEngine
         }
 
         $this->cache[$database][$table] = $entry;
+    }
+
+    public function deleteRows(string $database, string $table, array $indices): void
+    {
+        $entry = $this->tableEntry($database, $table);
+        if ($indices === []) {
+            // 空 indices no-op（表已校验存在）
+            return;
+        }
+
+        $slots = $entry['slots'];
+        $dead = $entry['dead'];
+        $visible = count($slots) - $dead;
+
+        // 校验针对稠密视图：越界（<0 或 >= 当前可见行数）/ 重复抛
+        $seen = [];
+        foreach ($indices as $index) {
+            if ($index < 0 || $index >= $visible) {
+                throw new StorageException("删除序号越界: {$database}.{$table}#{$index}（当前行数 {$visible}）");
+            }
+            if (isset($seen[$index])) {
+                throw new StorageException("删除序号重复: {$database}.{$table}#{$index}");
+            }
+            $seen[$index] = true;
+        }
+
+        // 稠密序号映射到槽位下标：单趟扫描，非 null 计数即稠密序号
+        $slotOf = [];
+        $dense = 0;
+        foreach ($slots as $slotIndex => $slot) {
+            if ($slot === null) {
+                continue;
+            }
+            if (isset($seen[$dense])) {
+                $slotOf[] = $slotIndex;
+            }
+            $dense++;
+        }
+
+        // 打墓碑：受影响槽位置 null，按槽位定位所在页
+        $ps = $entry['page_size'];
+        $pages = $entry['pages'];
+        $dirtyPages = [];
+        foreach ($slotOf as $slotIndex) {
+            $slots[$slotIndex] = null;
+            $dirtyPages[intdiv($slotIndex, $ps)] = true;
+        }
+
+        // 受影响页 gen+1 重写（页内保留其他槽位含既有墓碑，页槽位总数不变）
+        $newPages = $pages;
+        foreach (array_keys($dirtyPages) as $p) {
+            $gen = ($pages[$p] ?? -1) + 1;
+            $this->writePage($database, $table, $p, $gen, array_slice($slots, $p * $ps, $ps));
+            $newPages[$p] = $gen;
+        }
+
+        // meta 提交（提交点）：dead += 本次删除数
+        $dead += count($indices);
+        $entry['slots'] = $slots;
+        $entry['dead'] = $dead;
+        $entry['pages'] = $newPages;
+        $this->writeMeta($database, $table, $entry);
+        $this->cache[$database][$table] = $entry;
+
+        // 旧代数页清理（删除失败可容忍，加载时兜底清理）
+        foreach (array_keys($dirtyPages) as $p) {
+            $file = $this->pageFile($database, $table, $p, $pages[$p]);
+            if (is_file($file)) {
+                @unlink($file);
+            }
+        }
+
+        // 压实判定：死槽绝对数与占比双阈值同时满足才全量压实（避免小表频繁重排）
+        if ($dead >= self::COMPACT_MIN_DEAD
+            && $dead >= (int) ceil(count($slots) * self::COMPACT_RATIO)
+        ) {
+            $denseRows = array_values(array_filter($slots, static fn ($slot): bool => $slot !== null));
+            $this->rewriteDense($database, $table, $entry, $denseRows);
+        }
+    }
+
+    /**
+     * 全量重排（压实 / 墓碑态 writeRows 共用）：丢弃墓碑，以稠密行重建全部页并归零 dead
+     *
+     * 页 gen 整体 +1（新扩页首代为 0）：先写新代数页文件再提交 meta，保持既有崩溃安全模型
+     *
+     * @param array{schema: TableSchema, slots: list<array<string,mixed>|null>, ai: int, pages: list<int>, page_size: int, dead: int, loaded: bool} $entry
+     * @param list<array<string,mixed>> $rows
+     */
+    private function rewriteDense(string $database, string $table, array $entry, array $rows): void
+    {
+        $ps = $entry['page_size'];
+        $oldPages = $entry['pages'];
+        $oldPageCount = count($oldPages);
+        $newCount = count($rows);
+        $newPageCount = $newCount > 0 ? intdiv($newCount + $ps - 1, $ps) : 0;
+
+        // a. 全部新页 gen+1 写新文件（新扩页首代为 0）
+        $newPages = [];
+        for ($p = 0; $p < $newPageCount; $p++) {
+            $gen = ($oldPages[$p] ?? -1) + 1;
+            $this->writePage($database, $table, $p, $gen, array_slice($rows, $p * $ps, $ps));
+            $newPages[$p] = $gen;
+        }
+
+        // b. meta 提交（提交点）：压实后 slots=稠密行、dead=0
+        $entry['slots'] = $rows;
+        $entry['dead'] = 0;
+        $entry['pages'] = $newPages;
+        $this->writeMeta($database, $table, $entry);
+        $this->cache[$database][$table] = $entry;
+
+        // c. 全部旧代数页清理（含收缩产生的越界旧页；删除失败可容忍，加载时兜底清理）
+        for ($p = 0; $p < $oldPageCount; $p++) {
+            $file = $this->pageFile($database, $table, $p, $oldPages[$p]);
+            if (is_file($file)) {
+                @unlink($file);
+            }
+        }
     }
 
     public function autoIncrement(string $database, string $table): int
@@ -450,19 +601,19 @@ final class PagedJsonEngine implements StorageEngine
     }
 
     /**
-     * 全量重写一张表：所有页按缓存 page_size 重新切片、gen 尽量保持，meta 重写
+     * 全量重写一张表：所有页按缓存 page_size 从 slots 重新切片（保留墓碑）、gen 尽量保持，meta 重写
      */
     private function rewriteTable(string $database, string $table): void
     {
         $entry = $this->cache[$database][$table];
         $ps = $entry['page_size'];
-        $count = count($entry['rows']);
+        $count = count($entry['slots']);
         $newPageCount = intdiv($count + $ps - 1, $ps);
 
         $newPages = [];
         for ($p = 0; $p < $newPageCount; $p++) {
             $newPages[$p] = $entry['pages'][$p] ?? 0;
-            $this->writePage($database, $table, $p, $newPages[$p], array_slice($entry['rows'], $p * $ps, $ps));
+            $this->writePage($database, $table, $p, $newPages[$p], array_slice($entry['slots'], $p * $ps, $ps));
         }
 
         $entry['pages'] = $newPages;
@@ -473,9 +624,9 @@ final class PagedJsonEngine implements StorageEngine
     }
 
     /**
-     * 原子写 meta：结构 / 自增值 / 页大小 / 每页代数
+     * 原子写 meta：结构 / 自增值 / 页大小 / 每页代数 / 死槽计数
      *
-     * @param array{schema: TableSchema, rows: list<array<string,mixed>>, ai: int, pages: list<int>, page_size: int, loaded: bool} $entry
+     * @param array{schema: TableSchema, slots: list<array<string,mixed>|null>, ai: int, pages: list<int>, page_size: int, dead: int, loaded: bool} $entry
      */
     private function writeMeta(string $database, string $table, array $entry): void
     {
@@ -484,6 +635,7 @@ final class PagedJsonEngine implements StorageEngine
             'auto_increment' => $entry['ai'],
             'page_size' => $entry['page_size'],
             'pages' => array_values($entry['pages']),
+            'dead' => $entry['dead'],
         ], self::JSON_FLAGS);
         if ($payload === false) {
             throw new StorageException("表 meta 无法编码为 JSON: {$database}.{$table}");
@@ -492,9 +644,9 @@ final class PagedJsonEngine implements StorageEngine
     }
 
     /**
-     * 写单个页文件（尾部页行数可不满）
+     * 写单个页文件（尾部页行数可不满；元素可为 null 墓碑）
      *
-     * @param list<array<string,mixed>> $rows
+     * @param list<array<string,mixed>|null> $rows
      */
     private function writePage(string $database, string $table, int $pageNo, int $gen, array $rows): void
     {
@@ -527,7 +679,9 @@ final class PagedJsonEngine implements StorageEngine
     /**
      * 读取并校验 meta；任何失败抛 StorageException（消息含文件路径）
      *
-     * @return array{schema: TableSchema, ai: int, page_size: int, pages: list<int>}
+     * dead 键缺省视为 0（兼容 v1.1 无墓碑时代的 meta 文件）
+     *
+     * @return array{schema: TableSchema, ai: int, page_size: int, pages: list<int>, dead: int}
      */
     private function readMeta(string $database, string $table): array
     {
@@ -557,19 +711,25 @@ final class PagedJsonEngine implements StorageEngine
             }
             $pages[] = $gen;
         }
+        $dead = $data['dead'] ?? 0;
+        if (!is_int($dead) || $dead < 0) {
+            throw new StorageException("表 meta 文件 dead 结构非法: {$file}");
+        }
         try {
             $schema = TableSchema::fromArray($data['schema']);
         } catch (StorageException $e) {
             throw new StorageException("表 meta 文件结构非法: {$file} ({$e->getMessage()})");
         }
 
-        return ['schema' => $schema, 'ai' => $data['auto_increment'], 'page_size' => $data['page_size'], 'pages' => $pages];
+        return ['schema' => $schema, 'ai' => $data['auto_increment'], 'page_size' => $data['page_size'], 'pages' => $pages, 'dead' => $dead];
     }
 
     /**
      * 读取单个页文件；缺失或结构非法抛 StorageException（消息含文件路径）
      *
-     * @return list<array<string,mixed>>
+     * 每个元素允许为 null（墓碑）或数组（行）
+     *
+     * @return list<array<string,mixed>|null>
      */
     private function readPage(string $database, string $table, int $pageNo, int $gen): array
     {
@@ -584,7 +744,7 @@ final class PagedJsonEngine implements StorageEngine
         }
         $rows = [];
         foreach ($data['rows'] as $row) {
-            if (!is_array($row)) {
+            if ($row !== null && !is_array($row)) {
                 throw new StorageException("页文件 rows 结构非法: {$file}");
             }
             $rows[] = $row;
@@ -594,9 +754,10 @@ final class PagedJsonEngine implements StorageEngine
     }
 
     /**
-     * 懒加载表条目：缓存优先，其次磁盘（readMeta → 按页号+gen 逐页读 → 拼接 rows）；不存在抛 StorageException
+     * 懒加载表条目：缓存优先，其次磁盘（readMeta → 按页号+gen 逐页读 → 拼接 slots 不过滤墓碑）；
+     * 不存在抛 StorageException；dead 按拼接结果中 null 槽位数重算（维持不变量自愈）
      *
-     * @return array{schema: TableSchema, rows: list<array<string,mixed>>, ai: int, pages: list<int>, page_size: int, loaded: bool}
+     * @return array{schema: TableSchema, slots: list<array<string,mixed>|null>, ai: int, pages: list<int>, page_size: int, dead: int, loaded: bool}
      */
     private function loadTable(string $database, string $table): array
     {
@@ -608,19 +769,20 @@ final class PagedJsonEngine implements StorageEngine
         }
 
         $meta = $this->readMeta($database, $table);
-        $rows = [];
+        $slots = [];
         foreach ($meta['pages'] as $p => $gen) {
-            foreach ($this->readPage($database, $table, $p, $gen) as $row) {
-                $rows[] = $row;
+            foreach ($this->readPage($database, $table, $p, $gen) as $slot) {
+                $slots[] = $slot;
             }
         }
 
         $entry = [
             'schema' => $meta['schema'],
-            'rows' => $rows,
+            'slots' => $slots,
             'ai' => $meta['ai'],
             'pages' => $meta['pages'],
             'page_size' => $meta['page_size'],
+            'dead' => count(array_keys($slots, null, true)),
             'loaded' => true,
         ];
         $this->cache[$database][$table] = $entry;
@@ -682,7 +844,9 @@ final class PagedJsonEngine implements StorageEngine
     }
 
     /**
-     * 校验还原后的状态结构（含 loaded/pages 字段检查），非法抛 StorageException
+     * 校验还原后的状态结构（含 loaded/pages/slots/dead 字段检查），非法抛 StorageException
+     *
+     * slots 元素必须为 null（墓碑）或数组（行）；dead 必须为非负 int
      *
      * @param array<mixed> $state
      */
@@ -694,14 +858,20 @@ final class PagedJsonEngine implements StorageEngine
             }
             foreach ($tables as $table => $entry) {
                 if (!is_string($table) || !is_array($entry)
-                    || !isset($entry['schema'], $entry['rows'], $entry['ai'], $entry['pages'], $entry['page_size'], $entry['loaded'])
+                    || !isset($entry['schema'], $entry['slots'], $entry['ai'], $entry['pages'], $entry['page_size'], $entry['dead'], $entry['loaded'])
                     || !$entry['schema'] instanceof TableSchema
-                    || !is_array($entry['rows'])
+                    || !is_array($entry['slots'])
                     || !is_int($entry['ai'])
                     || !is_array($entry['pages'])
                     || !is_int($entry['page_size']) || $entry['page_size'] < 1
+                    || !is_int($entry['dead']) || $entry['dead'] < 0
                     || !is_bool($entry['loaded'])) {
                     throw new StorageException('快照数据结构非法');
+                }
+                foreach ($entry['slots'] as $slot) {
+                    if ($slot !== null && !is_array($slot)) {
+                        throw new StorageException('快照数据结构非法');
+                    }
                 }
                 foreach ($entry['pages'] as $gen) {
                     if (!is_int($gen) || $gen < 0) {
@@ -715,7 +885,7 @@ final class PagedJsonEngine implements StorageEngine
     /**
      * 校验名称并加载表条目
      *
-     * @return array{schema: TableSchema, rows: list<array<string,mixed>>, ai: int, pages: list<int>, page_size: int, loaded: bool}
+     * @return array{schema: TableSchema, slots: list<array<string,mixed>|null>, ai: int, pages: list<int>, page_size: int, dead: int, loaded: bool}
      */
     private function tableEntry(string $database, string $table): array
     {

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Kingbes\Psql\Query\Condition;
 
 use Kingbes\Psql\Exception\QueryException;
+use Kingbes\Psql\Exception\StorageException;
 
 /**
  * 条件组：多个条件按 AND/OR 自左向右连接
@@ -96,6 +97,83 @@ final class ConditionGroup extends Condition
     public function isEmpty(): bool
     {
         return $this->conditions === [];
+    }
+
+    /**
+     * 序列化为数组；connectors 原样保留（空组为空数组）
+     *
+     * @return array<string, mixed>
+     */
+    public function toArray(): array
+    {
+        return [
+            'type' => 'group',
+            'conditions' => array_map(
+                static fn (Condition $condition): array => $condition->toArray(),
+                $this->conditions,
+            ),
+            'connectors' => $this->connectors,
+        ];
+    }
+
+    /**
+     * 从数组还原；结构非法/连接符非法抛 StorageException
+     *
+     * @param array<string, mixed> $data
+     */
+    public static function fromArray(array $data): self
+    {
+        $conditionsRaw = $data['conditions'] ?? null;
+        if (!is_array($conditionsRaw)) {
+            throw new StorageException('条件组缺少合法的 conditions 字段');
+        }
+        $connectorsRaw = $data['connectors'] ?? [];
+        if (!is_array($connectorsRaw)) {
+            throw new StorageException('条件组的 connectors 必须为数组');
+        }
+
+        $group = new self();
+        $group->conditions = [];
+        $group->connectors = [];
+        foreach ($conditionsRaw as $item) {
+            if (!is_array($item)) {
+                throw new StorageException('条件组的子条件必须为数组');
+            }
+            $group->conditions[] = Condition::fromArray($item);
+        }
+        foreach ($connectorsRaw as $connector) {
+            if (!is_string($connector) || ($connector !== 'AND' && $connector !== 'OR')) {
+                throw new StorageException('条件组的 connectors 仅允许 AND/OR');
+            }
+            $group->connectors[] = $connector;
+        }
+
+        return $group;
+    }
+
+    /**
+     * 列名精确匹配替换后的新实例；子条件递归重建，connectors 原样拷贝
+     */
+    public function withColumnRenamed(string $from, string $to): self
+    {
+        $group = new self();
+        $group->conditions = array_map(
+            static fn (Condition $condition): Condition => $condition->withColumnRenamed($from, $to),
+            $this->conditions,
+        );
+        $group->connectors = $this->connectors;
+
+        return $group;
+    }
+
+    /**
+     * 递归校验每个子条件的比较值；违规抛 SchemaException
+     */
+    public function assertScalarValues(): void
+    {
+        foreach ($this->conditions as $condition) {
+            $condition->assertScalarValues();
+        }
     }
 
     /**

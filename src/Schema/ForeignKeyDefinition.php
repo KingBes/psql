@@ -7,13 +7,14 @@ namespace Kingbes\Psql\Schema;
 use Kingbes\Psql\Exception\SchemaException;
 
 /**
- * 外键 DSL：foreignKey('col')->references('t','c')->onDeleteCascade()
+ * 外键 DSL：foreignKey('col')->references('t','c')->onDelete(CASCADE)->onUpdate(SET_NULL)
  */
 final class ForeignKeyDefinition
 {
     private ?string $refTable = null;
     private ?string $refColumn = null;
-    private bool $onDeleteCascade = false;
+    private ?ForeignKeyAction $onDelete = null;
+    private ?ForeignKeyAction $onUpdate = null;
 
     /**
      * 构造时即注册进 Blueprint 内部列表
@@ -35,13 +36,31 @@ final class ForeignKeyDefinition
     }
 
     /**
-     * 设置级联删除
+     * 设置删除策略
+     */
+    public function onDelete(ForeignKeyAction $action): static
+    {
+        $this->onDelete = $action;
+
+        return $this;
+    }
+
+    /**
+     * 设置更新策略
+     */
+    public function onUpdate(ForeignKeyAction $action): static
+    {
+        $this->onUpdate = $action;
+
+        return $this;
+    }
+
+    /**
+     * 设置级联删除（onDelete(CASCADE) 别名，兼容既有用法）
      */
     public function onDeleteCascade(): static
     {
-        $this->onDeleteCascade = true;
-
-        return $this;
+        return $this->onDelete(ForeignKeyAction::CASCADE);
     }
 
     /**
@@ -53,6 +72,12 @@ final class ForeignKeyDefinition
             throw new SchemaException("外键 {$this->column} 未调用 references() 定义引用目标");
         }
 
-        return new ForeignKey($this->column, $this->refTable, $this->refColumn, $this->onDeleteCascade);
+        return new ForeignKey(
+            $this->column,
+            $this->refTable,
+            $this->refColumn,
+            $this->onDelete ?? ForeignKeyAction::RESTRICT,
+            $this->onUpdate ?? ForeignKeyAction::RESTRICT,
+        );
     }
 }

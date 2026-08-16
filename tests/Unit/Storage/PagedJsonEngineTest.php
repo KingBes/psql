@@ -436,6 +436,226 @@ final class PagedJsonEngineTest extends StorageEngineContractTestCase
         $this->assertSame(3, $fresh->autoIncrement('db', 'new'));
     }
 
+    public function testDeleteRowsTombstoneOnlyRewritesAffectedPage(): void
+    {
+        $engine = new PagedJsonEngine($this->root, 2);
+        $engine->createDatabase('db');
+        $engine->createTable('db', $this->makeSchema('t'));
+
+        $rows = [];
+        for ($i = 1; $i <= 6; $i++) {
+            $rows[] = ['id' => $i, 'name' => 'n' . $i];
+        }
+        $engine->writeRows('db', 't', $rows);
+
+        $dir = $this->root . '/db';
+        $before = $this->pageSnapshot($dir);
+        $this->assertSame(['t.0.0.page.json', 't.1.0.page.json', 't.2.0.page.json'], array_keys($before));
+
+        // 删除中间行（稠密索引 2 → 槽位 2 → 页 1）：仅页 1 gen+1，其余页逐字节不变
+        $engine->deleteRows('db', 't', [2]);
+
+        $after = $this->pageSnapshot($dir);
+        $this->assertSame(['t.0.0.page.json', 't.1.1.page.json', 't.2.0.page.json'], array_keys($after));
+        $this->assertSame($before['t.0.0.page.json'], $after['t.0.0.page.json']);
+        $this->assertSame($before['t.2.0.page.json'], $after['t.2.0.page.json']);
+        $this->assertFileDoesNotExist($dir . '/t.1.0.page.json');
+
+        // 页 1 内容：槽位 0 为墓碑 null，槽位 1 保留原行
+        $page = json_decode((string) file_get_contents($dir . '/t.1.1.page.json'), true);
+        $this->assertSame([null, ['id' => 4, 'name' => 'n4']], $page['rows']);
+
+        // meta 记录 dead=1
+        $meta = json_decode((string) file_get_contents($dir . '/t.meta.json'), true);
+        $this->assertSame(1, $meta['dead']);
+
+        // 对外稠密视图：剩余 5 行
+        $expected = [$rows[0], $rows[1], $rows[3], $rows[4], $rows[5]];
+        $this->assertSame($expected, $engine->readRows('db', 't'));
+
+        // 新实例重开：数据一致（页内 null 反序列化为墓碑）
+        $this->assertSame($expected, (new PagedJsonEngine($this->root))->readRows('db', 't'));
+    }
+
+    public function testDeleteRowsAcrossPagesRewritesPagesIndependently(): void
+    {
+        $engine = new PagedJsonEngine($this->root, 2);
+        $engine->createDatabase('db');
+        $engine->createTable('db', $this->makeSchema('t'));
+
+        $rows = [];
+        for ($i = 1; $i <= 6; $i++) {
+            $rows[] = ['id' => $i, 'name' => 'n' . $i];
+        }
+        $engine->writeRows('db', 't', $rows);
+
+        $dir = $this->root . '/db';
+
+        // 删除稠密 0（页 0）与 4（页 2）：页 1 完全不动
+        $engine->deleteRows('db', 't', [0, 4]);
+        $afterFirst = $this->pageSnapshot($dir);
+        $this->assertSame(['t.0.1.page.json', 't.1.0.page.json', 't.2.1.page.json'], array_keys($afterFirst));
+
+        // 再删当前稠密索引 2（原行 id=4，槽位 3 → 页 1）：仅页 1 重写
+        $page0Hash = $afterFirst['t.0.1.page.json'];
+        $page2Hash = $afterFirst['t.2.1.page.json'];
+        $engine->deleteRows('db', 't', [2]);
+
+        $afterSecond = $this->pageSnapshot($dir);
+        $this->assertSame(['t.0.1.page.json', 't.1.1.page.json', 't.2.1.page.json'], array_keys($afterSecond));
+        $this->assertSame($page0Hash, $afterSecond['t.0.1.page.json'], '未涉及页不得重写');
+        $this->assertSame($page2Hash, $afterSecond['t.2.1.page.json'], '未涉及页不得重写');
+
+        // 页槽位总数不变：3 页 × 2 槽 = 6，dead=3
+        $meta = json_decode((string) file_get_contents($dir . '/t.meta.json'), true);
+        $this->assertSame(3, $meta['dead']);
+        $this->assertSame(3, count($meta['pages']));
+
+        $expected = [$rows[1], $rows[2], $rows[5]];
+        $this->assertSame($expected, $engine->readRows('db', 't'));
+        $this->assertSame($expected, (new PagedJsonEngine($this->root))->readRows('db', 't'));
+    }
+
+    public function testCompactionTriggeredAtThreshold(): void
+    {
+        $engine = new PagedJsonEngine($this->root, 1);
+        $engine->createDatabase('db');
+        $engine->createTable('db', $this->makeSchema('t'));
+
+        $rows = [];
+        for ($i = 1; $i <= 250; $i++) {
+            $rows[] = ['id' => $i, 'name' => 'n' . $i];
+        }
+        $engine->writeRows('db', 't', $rows);
+
+        $dir = $this->root . '/db';
+
+        // 删 99 行：dead=99 < 100（绝对数阈值不满足）→ 不压实，页文件数不变
+        $engine->deleteRows('db', 't', range(0, 98));
+        $this->assertCount(250, $this->pageSnapshot($dir), '未达阈值不得压实');
+        $meta = json_decode((string) file_get_contents($dir . '/t.meta.json'), true);
+        $this->assertSame(99, $meta['dead']);
+        $this->assertCount(151, $engine->readRows('db', 't'));
+
+        // 再删 1 行：dead=100 ≥ 100 且 ≥ ceil(250*0.4)=100 → 触发压实
+        $engine->deleteRows('db', 't', [0]);
+
+        $pages = $this->pageSnapshot($dir);
+        $this->assertCount(150, $pages, '压实后页文件数应回到剩余行数（pageSize=1）');
+
+        $meta = json_decode((string) file_get_contents($dir . '/t.meta.json'), true);
+        $this->assertSame(0, $meta['dead'], '压实后 dead 归零');
+        $this->assertCount(150, $meta['pages']);
+
+        // 数据一致：剩余 id 101..250
+        $expected = [];
+        for ($i = 101; $i <= 250; $i++) {
+            $expected[] = ['id' => $i, 'name' => 'n' . $i];
+        }
+        $this->assertSame($expected, $engine->readRows('db', 't'));
+        $this->assertSame($expected, (new PagedJsonEngine($this->root))->readRows('db', 't'));
+    }
+
+    public function testWriteRowsAfterTombstonesResetsDeadAndRebuilds(): void
+    {
+        $engine = new PagedJsonEngine($this->root, 2);
+        $engine->createDatabase('db');
+        $engine->createTable('db', $this->makeSchema('t'));
+
+        $rows = [];
+        for ($i = 1; $i <= 6; $i++) {
+            $rows[] = ['id' => $i, 'name' => 'n' . $i];
+        }
+        $engine->writeRows('db', 't', $rows);
+
+        $dir = $this->root . '/db';
+        $engine->deleteRows('db', 't', [1]);
+        $this->assertSame(
+            ['t.0.1.page.json', 't.1.0.page.json', 't.2.0.page.json'],
+            array_keys($this->pageSnapshot($dir))
+        );
+
+        // 墓碑态下 writeRows（修改首行 + 尾部 append）：全量重排，dead 清零
+        // （5 稠密行 + 1 追加 = 6 行 → 3 页；重排前 pages=[1,0,0]，全部页 gen+1 → [2,1,1]）
+        $rows = array_values(array_filter($rows, static fn (int $k): bool => $k !== 1, ARRAY_FILTER_USE_KEY));
+        $rows[0]['name'] = 'changed';
+        $rows[] = ['id' => 7, 'name' => 'n7'];
+        $engine->writeRows('db', 't', $rows);
+
+        $meta = json_decode((string) file_get_contents($dir . '/t.meta.json'), true);
+        $this->assertSame(0, $meta['dead'], 'writeRows 后 dead 恒为 0');
+        $this->assertSame([2, 1, 1], $meta['pages'], '全部既有页 gen+1');
+        $this->assertSame(
+            ['t.0.2.page.json', 't.1.1.page.json', 't.2.1.page.json'],
+            array_keys($this->pageSnapshot($dir))
+        );
+
+        $this->assertSame($rows, $engine->readRows('db', 't'));
+        $this->assertSame($rows, (new PagedJsonEngine($this->root))->readRows('db', 't'));
+    }
+
+    public function testWriteRowsNoDiffKeepsIncrementalWhenNoTombstone(): void
+    {
+        $engine = new PagedJsonEngine($this->root, 2);
+        $engine->createDatabase('db');
+        $engine->createTable('db', $this->makeSchema('t'));
+
+        $rows = [];
+        for ($i = 1; $i <= 4; $i++) {
+            $rows[] = ['id' => $i, 'name' => 'n' . $i];
+        }
+        $engine->writeRows('db', 't', $rows);
+
+        $dir = $this->root . '/db';
+        $before = $this->pageSnapshot($dir);
+
+        // 无墓碑时的原地更新仍走逐页 diff：仅页 0 gen+1
+        $rows[1]['name'] = 'changed';
+        $engine->writeRows('db', 't', $rows);
+
+        $this->assertSame(
+            ['t.0.1.page.json', 't.1.0.page.json'],
+            array_keys($this->pageSnapshot($dir))
+        );
+        $this->assertSame($before['t.1.0.page.json'], md5_file($dir . '/t.1.0.page.json'));
+    }
+
+    public function testSnapshotRestoreWithTombstoneState(): void
+    {
+        $engine = new PagedJsonEngine($this->root, 2);
+        $engine->createDatabase('db');
+        $engine->createTable('db', $this->makeSchema('t'));
+
+        $rows = [];
+        for ($i = 1; $i <= 6; $i++) {
+            $rows[] = ['id' => $i, 'name' => 'n' . $i];
+        }
+        $engine->writeRows('db', 't', $rows);
+
+        // 制造墓碑态：dead=1
+        $engine->deleteRows('db', 't', [2]);
+        $snapshot = $engine->snapshot();
+
+        // 快照后继续变更：再删 + 全量替换
+        $engine->deleteRows('db', 't', [0]);
+        $engine->writeRows('db', 't', [['id' => 99, 'name' => 'x']]);
+
+        // 回滚到墓碑态快照
+        $engine->restore($snapshot);
+        $expected = [$rows[0], $rows[1], $rows[3], $rows[4], $rows[5]];
+        $this->assertSame($expected, $engine->readRows('db', 't'));
+
+        // restore 落盘后 meta 与页文件保留墓碑
+        $meta = json_decode((string) file_get_contents($this->root . '/db/t.meta.json'), true);
+        $this->assertSame(1, $meta['dead']);
+
+        // 新实例重开：墓碑态数据一致，且可继续删除（稠密序号基于过滤后视图）
+        $fresh = new PagedJsonEngine($this->root);
+        $this->assertSame($expected, $fresh->readRows('db', 't'));
+        $fresh->deleteRows('db', 't', [0]);
+        $this->assertSame([$rows[1], $rows[3], $rows[4], $rows[5]], $fresh->readRows('db', 't'));
+    }
+
     /**
      * 页文件清单快照：文件名 => 内容 md5（键按 scandir 顺序，调用方自行断言）
      *

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Kingbes\Psql\Schema;
 
 use Kingbes\Psql\Exception\SchemaException;
+use Kingbes\Psql\Query\Condition\Condition;
 
 /**
  * 表结构构建器：流畅定义列与约束
@@ -24,6 +25,12 @@ class Blueprint
 
     /** @var list<list<string>> */
     private array $uniqueKeys = [];
+
+    /** @var list<CheckConstraint> */
+    private array $checks = [];
+
+    /** @var list<TableIndex> */
+    private array $indexes = [];
 
     // ---- 类型方法 ----
 
@@ -176,6 +183,35 @@ class Blueprint
     }
 
     /**
+     * 复合主键（也接受单列）；列必须已定义，列内重复抛 SchemaException
+     */
+    public function primary(string ...$columns): void
+    {
+        if ($columns === []) {
+            throw new SchemaException('复合主键至少需要一列');
+        }
+        $defined = [];
+        foreach ($this->columns as $definition) {
+            $defined[] = $definition->name();
+        }
+        $seen = [];
+        foreach ($columns as $column) {
+            if (!in_array($column, $defined, true)) {
+                throw new SchemaException("复合主键引用了未定义的列: {$column}");
+            }
+            if (in_array($column, $seen, true)) {
+                throw new SchemaException("复合主键列存在重复: {$column}");
+            }
+            $seen[] = $column;
+        }
+        foreach ($this->columns as $definition) {
+            if (in_array($definition->name(), $seen, true)) {
+                $definition->primaryKey();
+            }
+        }
+    }
+
+    /**
      * 外键 DSL 入口（构造时即注册进内部列表）
      */
     public function foreignKey(string $column): ForeignKeyDefinition
@@ -193,6 +229,50 @@ class Blueprint
         $this->foreignKeyDefinitions[] = $definition;
     }
 
+    /**
+     * CHECK 约束：condition 求值为假的行禁止写入（insert 默认回填后 / update 应用新值后求值）；
+     * 名字重复抛 SchemaException；条件值非标量/null 注册时即抛 SchemaException；
+     * 空 ConditionGroup 允许（恒真）
+     */
+    public function check(string $name, Condition $condition): void
+    {
+        foreach ($this->checks as $existing) {
+            if ($existing->name === $name) {
+                throw new SchemaException("CHECK 约束名重复: {$name}");
+            }
+        }
+        $condition->assertScalarValues();
+        $this->checks[] = new CheckConstraint($name, $condition);
+    }
+
+    /**
+     * 建表时定义二级索引；索引名自动生成 idx_<col1>_<col2>...；
+     * 空参数/列内重复/同一列组合重复定义抛 SchemaException；
+     * 列存在性不在此校验（列可能后定义），由 TableSchema 构造器统一校验
+     */
+    public function index(string ...$columns): void
+    {
+        if ($columns === []) {
+            throw new SchemaException('索引至少需要一列');
+        }
+        $seen = [];
+        foreach ($columns as $column) {
+            if (in_array($column, $seen, true)) {
+                throw new SchemaException("索引列存在重复: {$column}");
+            }
+            $seen[] = $column;
+        }
+        foreach ($this->indexes as $existing) {
+            if ($existing->coversColumns(...$columns)) {
+                throw new SchemaException(
+                    '索引列组合重复定义: ' . implode(',', $columns)
+                );
+            }
+        }
+
+        $this->indexes[] = new TableIndex('idx_' . implode('_', $columns), array_values($columns));
+    }
+
     // ---- 产出 ----
 
     /**
@@ -206,7 +286,6 @@ class Blueprint
 
         $columns = [];
         $names = [];
-        $primaryKeyCount = 0;
         foreach ($this->columns as $definition) {
             $column = $definition->toSchema();
             if (preg_match(self::NAME_PATTERN, $column->name) !== 1) {
@@ -216,13 +295,7 @@ class Blueprint
                 throw new SchemaException("重复列名: {$column->name}");
             }
             $names[] = $column->name;
-            if ($column->primaryKey) {
-                $primaryKeyCount++;
-            }
             $columns[] = $column;
-        }
-        if ($primaryKeyCount > 1) {
-            throw new SchemaException('至多允许一个主键列');
         }
 
         $foreignKeys = [];
@@ -230,7 +303,14 @@ class Blueprint
             $foreignKeys[] = $definition->toForeignKey();
         }
 
-        return new TableSchema($tableName, $columns, $this->uniqueKeys, $foreignKeys);
+        return new TableSchema(
+            $tableName,
+            $columns,
+            $this->uniqueKeys,
+            $foreignKeys,
+            $this->checks,
+            $this->indexes,
+        );
     }
 
     /**

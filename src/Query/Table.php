@@ -33,7 +33,7 @@ final class Table
         }
     }
 
-    public function select(string|AggregateExpression ...$columns): SelectBuilder
+    public function select(string|AggregateExpression|ProjectionExpression ...$columns): SelectBuilder
     {
         return $this->builder()->select(...$columns);
     }
@@ -49,6 +49,22 @@ final class Table
     public function first(): ?array
     {
         return $this->builder()->first();
+    }
+
+    /**
+     * 分批处理查询结果（委托构建器）
+     */
+    public function chunk(int $size, callable $handler): int
+    {
+        return $this->builder()->chunk($size, $handler);
+    }
+
+    /**
+     * 惰性游标（委托构建器）
+     */
+    public function cursor(): \Generator
+    {
+        return $this->builder()->cursor();
     }
 
     /**
@@ -80,6 +96,22 @@ final class Table
     public function insertMany(array $rows): InsertResult
     {
         return (new Writer($this->requireConnection()))->insert($this->name, $this->alias, $rows);
+    }
+
+    /**
+     * 无冲突插入返回 1；命中唯一约束更新该行返回 2（MySQL 惯例）
+     */
+    public function upsert(array $row): int
+    {
+        return (new Writer($this->requireConnection()))->upsert($this->name, $this->alias, $row);
+    }
+
+    /**
+     * 无冲突插入返回 1；唯一冲突静默跳过返回 0（自增不消耗）
+     */
+    public function insertIgnore(array $row): int
+    {
+        return (new Writer($this->requireConnection()))->insertIgnore($this->name, $this->alias, $row);
     }
 
     /**
@@ -147,14 +179,36 @@ final class Table
         return $this->builder()->orWhere($column, ...$args);
     }
 
-    public function whereIn(string $column, array $values): SelectBuilder
+    /**
+     * IN 条件；值为数组或子查询构建器
+     */
+    public function whereIn(string $column, array|SelectBuilder $values): SelectBuilder
     {
         return $this->builder()->whereIn($column, $values);
     }
 
-    public function whereNotIn(string $column, array $values): SelectBuilder
+    /**
+     * NOT IN 条件；值为数组或子查询构建器
+     */
+    public function whereNotIn(string $column, array|SelectBuilder $values): SelectBuilder
     {
         return $this->builder()->whereNotIn($column, $values);
+    }
+
+    /**
+     * EXISTS (子查询) 条件
+     */
+    public function whereExists(SelectBuilder $sub): SelectBuilder
+    {
+        return $this->builder()->whereExists($sub);
+    }
+
+    /**
+     * NOT EXISTS (子查询) 条件
+     */
+    public function whereNotExists(SelectBuilder $sub): SelectBuilder
+    {
+        return $this->builder()->whereNotExists($sub);
     }
 
     public function whereBetween(string $column, mixed $min, mixed $max): SelectBuilder
@@ -205,6 +259,22 @@ final class Table
     public function distinct(): SelectBuilder
     {
         return $this->builder()->distinct();
+    }
+
+    /**
+     * 追加 UNION（去重联合）
+     */
+    public function union(SelectBuilder $query): SelectBuilder
+    {
+        return $this->builder()->union($query);
+    }
+
+    /**
+     * 追加 UNION ALL（保留重复）
+     */
+    public function unionAll(SelectBuilder $query): SelectBuilder
+    {
+        return $this->builder()->unionAll($query);
     }
 
     private function builder(): SelectBuilder

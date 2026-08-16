@@ -98,6 +98,8 @@ abstract class StorageEngineContractTestCase extends TestCase
         $this->assertThrows(fn () => $engine->dropTable('missing', 't'), 'dropTable 缺库未抛异常');
         $this->assertThrows(fn () => $engine->renameTable('missing', 'a', 'b'), 'renameTable 缺库未抛异常');
         $this->assertThrows(fn () => $engine->replaceSchema('missing', 't', $this->makeSchema('t')), 'replaceSchema 缺库未抛异常');
+        $this->assertThrows(fn () => $engine->deleteRows('missing', 't', [0]), 'deleteRows 缺库未抛异常');
+        $this->assertThrows(fn () => $engine->deleteRows('missing', 't', []), 'deleteRows 空 indices 缺库未抛异常');
     }
 
     public function testOperationsOnMissingTableThrow(): void
@@ -112,6 +114,8 @@ abstract class StorageEngineContractTestCase extends TestCase
         $this->assertThrows(fn () => $engine->setAutoIncrement('db', 'ghost', 1), 'setAutoIncrement 缺表未抛异常');
         $this->assertThrows(fn () => $engine->renameTable('db', 'ghost', 'x1'), 'renameTable 缺表未抛异常');
         $this->assertThrows(fn () => $engine->replaceSchema('db', 'ghost', $this->makeSchema('ghost')), 'replaceSchema 缺表未抛异常');
+        $this->assertThrows(fn () => $engine->deleteRows('db', 'ghost', [0]), 'deleteRows 缺表未抛异常');
+        $this->assertThrows(fn () => $engine->deleteRows('db', 'ghost', []), 'deleteRows 空 indices 缺表未抛异常');
     }
 
     public function testRowsRoundTrip(): void
@@ -234,5 +238,177 @@ abstract class StorageEngineContractTestCase extends TestCase
         $this->assertSame([['id' => 3, 'name' => 'c']], $engine->readRows('db1', 'kept'));
         $engine->setAutoIncrement('db1', 'kept', 3);
         $this->assertSame(3, $engine->autoIncrement('db1', 'kept'));
+    }
+
+    public function testDeleteRowsAtHeadMiddleTail(): void
+    {
+        $engine = $this->createEngine();
+        $engine->createDatabase('db');
+        $engine->createTable('db', $this->makeSchema('t'));
+        $rows = [];
+        for ($i = 1; $i <= 5; $i++) {
+            $rows[] = ['id' => $i, 'name' => 'n' . $i];
+        }
+        $engine->writeRows('db', 't', $rows);
+
+        // 删中间行（索引 2）
+        $engine->deleteRows('db', 't', [2]);
+        $this->assertSame(
+            [$rows[0], $rows[1], $rows[3], $rows[4]],
+            $engine->readRows('db', 't'),
+            '删中间行后剩余行不正确'
+        );
+
+        // 删首行（索引 0）
+        $engine->deleteRows('db', 't', [0]);
+        $this->assertSame(
+            [$rows[1], $rows[3], $rows[4]],
+            $engine->readRows('db', 't'),
+            '删首行后剩余行不正确'
+        );
+
+        // 删尾行（当前最后一行索引 2）
+        $engine->deleteRows('db', 't', [2]);
+        $this->assertSame(
+            [$rows[1], $rows[3]],
+            $engine->readRows('db', 't'),
+            '删尾行后剩余行不正确'
+        );
+    }
+
+    public function testDeleteRowsMultipleIndicesAtOnce(): void
+    {
+        $engine = $this->createEngine();
+        $engine->createDatabase('db');
+        $engine->createTable('db', $this->makeSchema('t'));
+        $rows = [];
+        for ($i = 1; $i <= 6; $i++) {
+            $rows[] = ['id' => $i, 'name' => 'n' . $i];
+        }
+        $engine->writeRows('db', 't', $rows);
+
+        // 乱序多行一次删除
+        $engine->deleteRows('db', 't', [4, 0, 2]);
+        $this->assertSame(
+            [$rows[1], $rows[3], $rows[5]],
+            $engine->readRows('db', 't'),
+            '多行删除后剩余行不正确'
+        );
+
+        // 全删
+        $engine->deleteRows('db', 't', [0, 1, 2]);
+        $this->assertSame([], $engine->readRows('db', 't'), '全删后表应为空');
+    }
+
+    public function testDeleteRowsEmptyIndicesIsNoOp(): void
+    {
+        $engine = $this->createEngine();
+        $engine->createDatabase('db');
+        $engine->createTable('db', $this->makeSchema('t'));
+        $rows = [['id' => 1, 'name' => 'a'], ['id' => 2, 'name' => 'b']];
+        $engine->writeRows('db', 't', $rows);
+
+        $engine->deleteRows('db', 't', []);
+        $this->assertSame($rows, $engine->readRows('db', 't'), '空 indices 应为 no-op');
+
+        // 空表上空 indices 同样 no-op
+        $engine->createTable('db', $this->makeSchema('empty'));
+        $engine->deleteRows('db', 'empty', []);
+        $this->assertSame([], $engine->readRows('db', 'empty'));
+    }
+
+    public function testDeleteRowsIndexOutOfBoundsThrows(): void
+    {
+        $engine = $this->createEngine();
+        $engine->createDatabase('db');
+        $engine->createTable('db', $this->makeSchema('t'));
+        $rows = [['id' => 1, 'name' => 'a'], ['id' => 2, 'name' => 'b'], ['id' => 3, 'name' => 'c']];
+        $engine->writeRows('db', 't', $rows);
+
+        $this->assertThrows(fn () => $engine->deleteRows('db', 't', [3]), '序号等于行数未抛异常');
+        $this->assertThrows(fn () => $engine->deleteRows('db', 't', [100]), '序号远超行数未抛异常');
+        $this->assertThrows(fn () => $engine->deleteRows('db', 't', [1, 3]), '含越界序号的集合未抛异常');
+        $this->assertSame($rows, $engine->readRows('db', 't'), '越界删除不得改动数据');
+
+        // 空表上任何序号均越界
+        $engine->createTable('db', $this->makeSchema('empty'));
+        $this->assertThrows(fn () => $engine->deleteRows('db', 'empty', [0]), '空表删除序号 0 未抛异常');
+    }
+
+    public function testDeleteRowsNegativeIndexThrows(): void
+    {
+        $engine = $this->createEngine();
+        $engine->createDatabase('db');
+        $engine->createTable('db', $this->makeSchema('t'));
+        $rows = [['id' => 1, 'name' => 'a'], ['id' => 2, 'name' => 'b']];
+        $engine->writeRows('db', 't', $rows);
+
+        $this->assertThrows(fn () => $engine->deleteRows('db', 't', [-1]), '负数序号未抛异常');
+        $this->assertThrows(fn () => $engine->deleteRows('db', 't', [0, -5]), '含负数序号的集合未抛异常');
+        $this->assertSame($rows, $engine->readRows('db', 't'), '负数删除不得改动数据');
+    }
+
+    public function testDeleteRowsDuplicateIndicesThrow(): void
+    {
+        $engine = $this->createEngine();
+        $engine->createDatabase('db');
+        $engine->createTable('db', $this->makeSchema('t'));
+        $rows = [['id' => 1, 'name' => 'a'], ['id' => 2, 'name' => 'b'], ['id' => 3, 'name' => 'c']];
+        $engine->writeRows('db', 't', $rows);
+
+        $this->assertThrows(fn () => $engine->deleteRows('db', 't', [1, 1]), '重复序号未抛异常');
+        $this->assertThrows(fn () => $engine->deleteRows('db', 't', [2, 0, 2]), '含重复序号的集合未抛异常');
+        $this->assertSame($rows, $engine->readRows('db', 't'), '重复删除不得改动数据');
+    }
+
+    public function testDeleteRowsKeepsDenseOrderingForSubsequentOperations(): void
+    {
+        $engine = $this->createEngine();
+        $engine->createDatabase('db');
+        $engine->createTable('db', $this->makeSchema('t'));
+        $rows = [];
+        for ($i = 1; $i <= 5; $i++) {
+            $rows[] = ['id' => $i, 'name' => 'n' . $i];
+        }
+        $engine->writeRows('db', 't', $rows);
+
+        // 删除索引 1 后，后续序号必须指向新的稠密序列
+        $engine->deleteRows('db', 't', [1]);
+        $engine->deleteRows('db', 't', [1]);
+        $this->assertSame(
+            [$rows[0], $rows[3], $rows[4]],
+            $engine->readRows('db', 't'),
+            '删除后稠密序号未正确重排'
+        );
+
+        // 再删索引 0（原首行）
+        $engine->deleteRows('db', 't', [0]);
+        $this->assertSame([$rows[3], $rows[4]], $engine->readRows('db', 't'));
+    }
+
+    public function testDeleteRowsThenWriteRowsAndAutoIncrement(): void
+    {
+        $engine = $this->createEngine();
+        $engine->createDatabase('db');
+        $engine->createTable('db', $this->makeSchema('t'));
+        $rows = [['id' => 1, 'name' => 'a'], ['id' => 2, 'name' => 'b'], ['id' => 3, 'name' => 'c']];
+        $engine->writeRows('db', 't', $rows);
+        $engine->setAutoIncrement('db', 't', 3);
+
+        $engine->deleteRows('db', 't', [0, 2]);
+
+        // 删除后自增值不受影响，且可继续推进
+        $this->assertSame(3, $engine->autoIncrement('db', 't'));
+        $engine->setAutoIncrement('db', 't', 4);
+        $this->assertSame(4, $engine->autoIncrement('db', 't'));
+
+        // 删除后 writeRows 全量替换照常
+        $replacement = [['id' => 9, 'name' => 'x']];
+        $engine->writeRows('db', 't', $replacement);
+        $this->assertSame($replacement, $engine->readRows('db', 't'));
+
+        // 替换后序号重新基于新数据
+        $engine->deleteRows('db', 't', [0]);
+        $this->assertSame([], $engine->readRows('db', 't'));
     }
 }

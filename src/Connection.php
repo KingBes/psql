@@ -7,10 +7,12 @@ namespace Kingbes\Psql;
 use Kingbes\Psql\Exception\QueryException;
 use Kingbes\Psql\Exception\SchemaException;
 use Kingbes\Psql\Exception\TransactionException;
+use Kingbes\Psql\Execution\IndexManager;
 use Kingbes\Psql\Query\Table;
 use Kingbes\Psql\Schema\AlterBlueprint;
 use Kingbes\Psql\Schema\Blueprint;
 use Kingbes\Psql\Schema\ColumnSchema;
+use Kingbes\Psql\Schema\TableIndex;
 use Kingbes\Psql\Schema\TableSchema;
 use Kingbes\Psql\Storage\EngineSnapshot;
 use Kingbes\Psql\Storage\StorageEngine;
@@ -27,6 +29,11 @@ final class Connection
     private string $database;
 
     private ?EngineSnapshot $transactionSnapshot = null;
+
+    /** 数据版本号：任何数据/结构变更后自增（索引缓存失效依据） */
+    private int $writeVersion = 0;
+
+    private ?IndexManager $indexManager = null;
 
     public function __construct(private StorageEngine $engine, string $database = 'main')
     {
@@ -79,6 +86,7 @@ final class Connection
         if ($name === $this->database) {
             $this->switchToMain();
         }
+        $this->recordWrite();
     }
 
     /**
@@ -104,6 +112,7 @@ final class Connection
             throw new SchemaException("表已存在: {$this->database}.{$name}");
         }
         $this->engine->createTable($this->database, $schema);
+        $this->recordWrite();
     }
 
     /**
@@ -115,6 +124,7 @@ final class Connection
             return;
         }
         $this->engine->createTable($this->database, $this->buildSchema($name, $definition));
+        $this->recordWrite();
     }
 
     /**
@@ -127,6 +137,7 @@ final class Connection
         }
         $this->assertTableNotReferenced($name);
         $this->engine->dropTable($this->database, $name);
+        $this->recordWrite();
     }
 
     public function hasTable(string $name): bool
@@ -148,6 +159,7 @@ final class Connection
     public function renameTable(string $from, string $to): void
     {
         $this->engine->renameTable($this->database, $from, $to);
+        $this->recordWrite();
     }
 
     /**
@@ -221,6 +233,8 @@ final class Connection
             array_merge($schema->columns, $addedColumns),
             $schema->uniqueKeys,
             $schema->foreignKeys,
+            $schema->checks,
+            $schema->indexes,
         );
 
         // 数据迁移：rename 键、删除 dropped 键、新增列回填默认值
@@ -243,6 +257,7 @@ final class Connection
 
         $this->engine->replaceSchema($this->database, $name, $schema);
         $this->engine->writeRows($this->database, $name, $rows);
+        $this->recordWrite();
     }
 
     /**
@@ -257,6 +272,89 @@ final class Connection
                 }
             }
         }
+    }
+
+    // ---- 索引 DDL ----
+
+    /**
+     * 创建二级索引（仅注册元数据，物理构建由执行层负责）；
+     * 表不存在透传 StorageException；索引名非法/重名/列不存在或重复抛 SchemaException
+     */
+    public function createIndex(string $table, string $name, string ...$columns): void
+    {
+        // 表不存在时 loadSchema 抛 StorageException，直接透传
+        $schema = $this->engine->loadSchema($this->database, $table);
+        if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $name) !== 1) {
+            throw new SchemaException("非法索引名: {$name}");
+        }
+        foreach ($schema->indexes as $existing) {
+            if ($existing->name === $name) {
+                throw new SchemaException(
+                    "表 {$this->database}.{$table} 已存在同名索引: {$name}"
+                );
+            }
+        }
+
+        // 列存在性与列内不重复交给 TableSchema 构造器统一校验
+        $newSchema = new TableSchema(
+            $schema->name,
+            $schema->columns,
+            $schema->uniqueKeys,
+            $schema->foreignKeys,
+            $schema->checks,
+            array_merge($schema->indexes, [new TableIndex($name, array_values($columns))]),
+        );
+        $this->engine->replaceSchema($this->database, $table, $newSchema);
+        $this->recordWrite();
+    }
+
+    /**
+     * 删除二级索引；表不存在透传 StorageException，索引不存在抛 SchemaException
+     */
+    public function dropIndex(string $table, string $name): void
+    {
+        // 表不存在时 loadSchema 抛 StorageException，直接透传
+        $schema = $this->engine->loadSchema($this->database, $table);
+        $indexes = [];
+        $found = false;
+        foreach ($schema->indexes as $index) {
+            if ($index->name === $name) {
+                $found = true;
+                continue;
+            }
+            $indexes[] = $index;
+        }
+        if (!$found) {
+            throw new SchemaException("索引不存在: {$this->database}.{$table}.{$name}");
+        }
+
+        $this->engine->replaceSchema(
+            $this->database,
+            $table,
+            new TableSchema(
+                $schema->name,
+                $schema->columns,
+                $schema->uniqueKeys,
+                $schema->foreignKeys,
+                $schema->checks,
+                $indexes,
+            ),
+        );
+        $this->recordWrite();
+    }
+
+    /**
+     * 是否存在指定索引；表不存在透传 StorageException
+     */
+    public function hasIndex(string $table, string $name): bool
+    {
+        foreach ($this->engine->loadSchema($this->database, $table)->indexes as $index) {
+            if ($index->name === $name) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     // ---- DML 入口 ----
@@ -313,6 +411,8 @@ final class Connection
         }
         $this->engine->restore($this->transactionSnapshot);
         $this->transactionSnapshot = null;
+        // restore 改写了引擎数据，必须失效索引缓存（最关键的失效点）
+        $this->recordWrite();
     }
 
     /**
@@ -321,6 +421,34 @@ final class Connection
     public function inTransaction(): bool
     {
         return $this->transactionSnapshot !== null;
+    }
+
+    // ---- 写版本与索引管理 ----
+
+    /**
+     * 数据版本号：任何数据/结构变更后自增（索引缓存失效依据）
+     */
+    public function writeVersion(): int
+    {
+        return $this->writeVersion;
+    }
+
+    /**
+     * @internal 记录一次写操作（Writer 与 DDL 变更路径调用）
+     */
+    public function recordWrite(): void
+    {
+        ++$this->writeVersion;
+    }
+
+    /**
+     * 连接级索引管理器单例（跨查询复用，随 writeVersion 自动失效）
+     *
+     * @internal
+     */
+    public function indexManager(): IndexManager
+    {
+        return $this->indexManager ??= new IndexManager($this);
     }
 
     // ---- 内部 ----

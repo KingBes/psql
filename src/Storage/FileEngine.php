@@ -33,6 +33,12 @@ abstract class FileEngine implements StorageEngine
         if (!is_writable($this->root)) {
             throw new StorageException("根目录不可写: {$this->root}");
         }
+        DirectoryLock::acquire($this->root);
+    }
+
+    public function __destruct()
+    {
+        DirectoryLock::release($this->root);
     }
 
     /**
@@ -239,6 +245,24 @@ abstract class FileEngine implements StorageEngine
         $this->writeTableFile($database, $table);
     }
 
+    public function deleteRows(string $database, string $table, array $indices): void
+    {
+        // 本引擎无墓碑：读 readRows → 校验 → 降序 unset → 全量替换写回（语义等同过滤后 writeRows）
+        $rows = $this->tableEntry($database, $table)['rows'];
+        if ($indices === []) {
+            // 空 indices no-op（表已校验存在）
+            return;
+        }
+        $this->assertDeleteIndices($rows, $indices, $database, $table);
+
+        $sorted = array_unique($indices);
+        rsort($sorted);
+        foreach ($sorted as $index) {
+            unset($rows[$index]);
+        }
+        $this->writeRows($database, $table, array_values($rows));
+    }
+
     public function autoIncrement(string $database, string $table): int
     {
         return $this->tableEntry($database, $table)['ai'];
@@ -293,6 +317,27 @@ abstract class FileEngine implements StorageEngine
     public function persist(): void
     {
         $this->syncDisk();
+    }
+
+    /**
+     * 校验删除序号集合：越界（<0 或 >= 当前行数）或重复抛 StorageException
+     *
+     * @param list<array<string,mixed>> $rows
+     * @param list<int> $indices
+     */
+    private function assertDeleteIndices(array $rows, array $indices, string $database, string $table): void
+    {
+        $count = count($rows);
+        $seen = [];
+        foreach ($indices as $index) {
+            if ($index < 0 || $index >= $count) {
+                throw new StorageException("删除序号越界: {$database}.{$table}#{$index}（当前行数 {$count}）");
+            }
+            if (isset($seen[$index])) {
+                throw new StorageException("删除序号重复: {$database}.{$table}#{$index}");
+            }
+            $seen[$index] = true;
+        }
     }
 
     /**

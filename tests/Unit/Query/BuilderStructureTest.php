@@ -395,4 +395,63 @@ final class BuilderStructureTest extends TestCase
         $this->assertSame($group, $outer->conditions[1]);
         $this->assertSame(['AND'], $outer->connectors);
     }
+
+    public function testOrWhereGroupAttachesGroupDirectlyWhenNoWhere(): void
+    {
+        $group = (new ConditionGroup())->where('age', '<', 18)->orWhere('vip', 1);
+
+        $query = $this->builder()->orWhereGroup($group)->toQuery();
+
+        $this->assertSame($group, $query->where);
+    }
+
+    public function testOrWhereGroupMergesExistingWhereIntoOuterGroup(): void
+    {
+        $group = (new ConditionGroup())->where('age', '<', 18)->orWhere('vip', 1);
+
+        $query = $this->builder()
+            ->where('status', 'active')
+            ->orWhereGroup($group)
+            ->toQuery();
+
+        $outer = $query->where;
+        $this->assertInstanceOf(ConditionGroup::class, $outer);
+        $this->assertCount(2, $outer->conditions);
+        $this->assertInstanceOf(ConditionGroup::class, $outer->conditions[0]);
+        $this->assertSame($group, $outer->conditions[1]);
+        $this->assertSame(['OR'], $outer->connectors);
+    }
+
+    public function testWhereWhereGroupOrWhereGroupChainNestsCorrectly(): void
+    {
+        $anded = (new ConditionGroup())->where('age', '<', 18)->orWhere('vip', 1);
+        $ored = (new ConditionGroup())->where('banned', 1);
+
+        $query = $this->builder()
+            ->where('status', 'active')
+            ->whereGroup($anded)
+            ->orWhereGroup($ored)
+            ->toQuery();
+
+        // 最外层：( ( status AND 组) ) OR 组
+        $outer = $query->where;
+        $this->assertInstanceOf(ConditionGroup::class, $outer);
+        $this->assertCount(2, $outer->conditions);
+        $this->assertSame(['OR'], $outer->connectors);
+        $this->assertSame($ored, $outer->conditions[1]);
+
+        // 中层：status AND 组
+        $middle = $outer->conditions[0];
+        $this->assertInstanceOf(ConditionGroup::class, $middle);
+        $this->assertCount(2, $middle->conditions);
+        $this->assertSame(['AND'], $middle->connectors);
+        $this->assertSame($anded, $middle->conditions[1]);
+
+        // 内层：普通 where 归入的条件组
+        $inner = $middle->conditions[0];
+        $this->assertInstanceOf(ConditionGroup::class, $inner);
+        $this->assertInstanceOf(Comparison::class, $inner->conditions[0]);
+        $this->assertSame('status', $inner->conditions[0]->column);
+        $this->assertSame('active', $inner->conditions[0]->value);
+    }
 }

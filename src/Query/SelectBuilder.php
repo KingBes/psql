@@ -10,6 +10,8 @@ use Kingbes\Psql\Execution\Executor;
 use Kingbes\Psql\Execution\Writer;
 use Kingbes\Psql\Query\Condition\Condition;
 use Kingbes\Psql\Query\Condition\ConditionGroup;
+use Kingbes\Psql\Query\Condition\ExistsCheck;
+use Kingbes\Psql\Query\Condition\SubqueryIn;
 use Kingbes\Psql\Result\ResultSet;
 
 /**
@@ -29,6 +31,9 @@ final class SelectBuilder
     /** @var list<AggregateExpression> */
     private array $aggregates = [];
 
+    /** @var list<ProjectionExpression> 投影表达式（函数/CASE） */
+    private array $expressions = [];
+
     /** @var list<string> */
     private array $groupBy = [];
 
@@ -45,6 +50,9 @@ final class SelectBuilder
 
     private ?int $offset = null;
 
+    /** @var list<UnionClause> 联合子句（UNION/UNION ALL，按声明顺序累加） */
+    private array $unions = [];
+
     /**
      * 构造期仅保存连接实例，不触碰其任何方法
      */
@@ -56,13 +64,15 @@ final class SelectBuilder
     }
 
     /**
-     * 追加输出列（字符串列名与聚合表达式混用）
+     * 追加输出列（字符串列名/聚合表达式/投影表达式混用）
      */
-    public function select(string|AggregateExpression ...$columns): static
+    public function select(string|AggregateExpression|ProjectionExpression ...$columns): static
     {
         foreach ($columns as $column) {
             if ($column instanceof AggregateExpression) {
                 $this->aggregates[] = $column;
+            } elseif ($column instanceof ProjectionExpression) {
+                $this->expressions[] = $column;
             } else {
                 $this->columns[] = $column;
             }
@@ -115,6 +125,22 @@ final class SelectBuilder
     }
 
     /**
+     * 挂载嵌套条件组（OR 语义）：where(...) OR ( 组内条件 )
+     */
+    public function orWhereGroup(ConditionGroup $group): static
+    {
+        if ($this->where === null) {
+            $this->where = $group;
+        } else {
+            $outer = new ConditionGroup();
+            $outer->add($this->where, 'AND')->add($group, 'OR');
+            $this->where = $outer;
+        }
+
+        return $this;
+    }
+
+    /**
      * OR 条件
      */
     public function orWhere(string $column, mixed ...$args): static
@@ -124,16 +150,54 @@ final class SelectBuilder
         return $this;
     }
 
-    public function whereIn(string $column, array $values): static
+    /**
+     * IN 条件；值为数组或子查询构建器（后者立即 toQuery 固化为子查询条件）
+     */
+    public function whereIn(string $column, array|self $values): static
     {
+        if ($values instanceof self) {
+            $this->group()->add(new SubqueryIn($column, $values->toQuery()), 'AND');
+
+            return $this;
+        }
+
         $this->group()->whereIn($column, $values);
 
         return $this;
     }
 
-    public function whereNotIn(string $column, array $values): static
+    /**
+     * NOT IN 条件；值为数组或子查询构建器
+     */
+    public function whereNotIn(string $column, array|self $values): static
     {
+        if ($values instanceof self) {
+            $this->group()->add(new SubqueryIn($column, $values->toQuery(), true), 'AND');
+
+            return $this;
+        }
+
         $this->group()->whereNotIn($column, $values);
+
+        return $this;
+    }
+
+    /**
+     * EXISTS (子查询) 条件（AND 语义）
+     */
+    public function whereExists(self $sub): static
+    {
+        $this->group()->add(new ExistsCheck($sub->toQuery()), 'AND');
+
+        return $this;
+    }
+
+    /**
+     * NOT EXISTS (子查询) 条件（AND 语义）
+     */
+    public function whereNotExists(self $sub): static
+    {
+        $this->group()->add(new ExistsCheck($sub->toQuery(), true), 'AND');
 
         return $this;
     }
@@ -252,6 +316,27 @@ final class SelectBuilder
     }
 
     /**
+     * 追加 UNION（去重联合）；重复调用按声明顺序累加，可链 3 个以上；
+     * 传入构建器自身携带的 unions 随其 toQuery 保留，执行时递归展开
+     */
+    public function union(self $query): static
+    {
+        $this->unions[] = new UnionClause('UNION', $query->toQuery());
+
+        return $this;
+    }
+
+    /**
+     * 追加 UNION ALL（保留重复）；语义同 union，仅不去重
+     */
+    public function unionAll(self $query): static
+    {
+        $this->unions[] = new UnionClause('UNION ALL', $query->toQuery());
+
+        return $this;
+    }
+
+    /**
      * 产出查询 DTO（供执行器）
      */
     public function toQuery(): SelectQuery
@@ -263,12 +348,14 @@ final class SelectBuilder
             $this->joins,
             $this->where,
             $this->aggregates,
+            $this->expressions,
             $this->groupBy,
             $this->having,
             $this->orderBy,
             $this->distinct,
             $this->limit,
             $this->offset,
+            $this->unions,
         );
     }
 
@@ -287,6 +374,64 @@ final class SelectBuilder
         $rows = $this->get()->rows();
 
         return $rows[0] ?? null;
+    }
+
+    /**
+     * 分批处理查询结果（LIMIT/OFFSET 分页实现）
+     *
+     * $handler(list<array<string,mixed>> $rows, int $iteration): bool —— 返回 false 提前终止
+     * 返回已处理的行数总数
+     */
+    public function chunk(int $size, callable $handler): int
+    {
+        if ($size < 1) {
+            throw new QueryException("chunk 大小必须 >= 1: {$size}");
+        }
+        if ($this->limit !== null || $this->offset !== null) {
+            throw new QueryException('chunk 与 limit/offset 不可同时使用');
+        }
+
+        $offset = 0;
+        $iteration = 1;
+        $processed = 0;
+
+        while (true) {
+            $clone = clone $this;
+            $clone->limit = $size;
+            $clone->offset = $offset;
+
+            $rows = $clone->get()->rows();
+            if ($rows === []) {
+                break;
+            }
+
+            $processed += count($rows);
+            if ($handler($rows, $iteration) === false) {
+                break;
+            }
+            if (count($rows) < $size) {
+                break;
+            }
+
+            $offset += $size;
+            $iteration++;
+        }
+
+        return $processed;
+    }
+
+    /**
+     * 惰性游标：返回生成器，查询在首次迭代时才执行
+     *
+     * 生成器函数体内的代码在第一次迭代前不会运行——可用于"仅在真正需要时执行查询"
+     *
+     * @return \Generator<int, array<string, mixed>, mixed, void>
+     */
+    public function cursor(): \Generator
+    {
+        foreach ($this->get() as $row) {
+            yield $row;
+        }
     }
 
     /**

@@ -21,16 +21,34 @@
 | `src/Exception/` | 异常体系：`PsqlException`（抽象基类）+ 六个具体异常 |
 | `src/Schema/` | `Blueprint` 建表 DSL、`ColumnSchema`/`TableSchema`（readonly 不可变结构）、`ForeignKey`、`AlterBlueprint` |
 | `src/Type/` | `ValueCaster`：PHP 值 → 列类型的校验与规范化 |
-| `src/Query/` | `Table` 表访问入口、`SelectBuilder` 链式构建器、`Condition/` 条件模型、`ConditionEvaluator` 条件求值、`Agg` 聚合工厂、`SelectQuery` 等 DTO |
-| `src/Execution/` | `Writer`（INSERT/UPDATE/DELETE 约束管线）、`Executor`（SELECT 流水线） |
+| `src/Query/` | `Table` 表访问入口、`SelectBuilder` 链式构建器、`Condition/` 条件模型、`ConditionEvaluator` 条件求值、`Agg` 聚合工厂、`Func`/`CaseWhen`/`ColumnRef` 投影表达式、`SelectQuery` 等 DTO |
+| `src/Execution/` | `Writer`（INSERT/UPDATE/DELETE 约束管线）、`Executor`（SELECT 流水线）、`IndexManager`（哈希索引缓存与预过滤）、`SubqueryResolver`（子查询解析） |
 | `src/Result/` | `ResultSet` 结果集、`InsertResult` 插入结果 |
-| `src/Storage/` | `StorageEngine` 接口、`MemoryEngine`、`JsonFileEngine`、`EngineSnapshot` |
+| `src/Storage/` | `StorageEngine` 接口、`MemoryEngine`、`JsonFileEngine`、`PagedJsonEngine`、`DirectoryLock`、`EngineSnapshot` |
 
-## 执行模型（v1）
+## 执行模型
 
-- **线性扫描**：查询全表遍历，无二级索引/B-Tree（正确性优先；索引列为后续版本方向）
-- **嵌套循环 JOIN**：INNER/LEFT/RIGHT 按声明顺序逐个应用
+- **哈希索引加速的等值查询**：WHERE 顶层条件全部为 AND 连接的等值比较且列集与某可用索引完全一致时，走 `IndexManager` 哈希预过滤（见下节）；未命中触发条件则回退全表线性扫描
+- **hash join**：等值 JOIN（INNER/LEFT/RIGHT）先构建哈希表再探测，复杂度 O(n+m)；非 '=' 运算符自动回退嵌套循环，输出顺序与嵌套循环实现一致
 - WHERE 求值采用 SQL NULL 三值逻辑；比较规则：两侧均数值性按数值、否则按字符串（区分大小写）
+- **子查询**：`whereIn`/`whereNotIn`/`whereExists`/`whereNotExists` 传入的子构建器经 `Execution\SubqueryResolver` 解析——作为独立查询完整执行（含自身 orderBy/limit/union）后，结果化为值列表或存在性判定进入常规条件求值；不支持相关子查询（引用外层列即未知列异常）
+- **UNION / UNION ALL**：各子方作为独立查询完整执行（保留各自排序/limit 语义）后由 `Executor` 按声明序合并——UNION 全集去重保首见顺序、UNION ALL 保留重复；外层收尾子句（distinct/orderBy/limit/offset）作用于合并结果
+- **表达式投影**：`Query\ProjectionExpression` 接口（`Func`/`CaseWhen`/`ColumnRef` 实现）在投影阶段对源限定行求值，支持任意嵌套（NULL 传播、coalesce 除外）；别名进入输出行，可被 orderBy/having/groupBy 引用
+- 写入路径的外键策略分发（DELETE/UPDATE 四策略）与 CHECK 约束求值均在 `Writer` 约束管线内完成
+
+### IndexManager（等值索引预过滤）
+
+`Execution\IndexManager` 维护连接级哈希索引缓存，为等值查询提供候选稠密行号预过滤：
+
+- **可用索引来源**：显式二级索引（`createIndex` / `Blueprint::index`）之外，主键列、单列 UNIQUE 约束列、联合唯一组**自动可用作索引**（无需显式建）
+- **触发条件**：WHERE 全部顶层条件为 AND 连接的等值比较（裸列名、值非 null），且列集与某可用索引完全一致（顺序不敏感）；范围查询、OR、`whereIn` 等自动回退全表扫描
+- **正确性保证**：哈希命中仅产出候选行号，`Executor` 对候选行仍完整求值原 WHERE 兜底——索引加速不改变查询结果，与全表扫描完全一致
+- **缓存失效**：以 `Connection::writeVersion`（任何数据/结构变更、事务回滚自增）为版本依据，版本不一致时该表索引缓存自动重建，无需手动管理
+- 性能参考：5 万行等值查询热查 ~0.02ms vs 全扫描 ~100ms
+
+### collation 与索引的正确性取舍
+
+`ci()` 列的比较折叠大小写（`mb_strtolower`），而哈希索引按**原始值**建键——`'A'` 与 `'a'` 哈希不同，若让 ci 查询走索引预过滤会把本该匹配的行错误过滤掉。因此**涉及 ci 列的查询自动跳过索引预过滤与 hash join**，回退全表扫描 / 嵌套循环，以性能换取结果正确性。约束判定（唯一/外键/CHECK）保持区分大小写、与索引行为一致，不受影响；未声明 `ci()` 的列行为与此前完全一致。
 
 ## 存储引擎
 
@@ -65,11 +83,13 @@ $db = new Connection(new PhpSerializeEngine('/data/appdb'));
 分页增量存储引擎——解决单文件引擎"改一行重写全表"的写放大问题：
 
 - 磁盘布局：每表一个 meta（`<表>.meta.json`：结构/自增值/页大小/每页代数）+ 若干页文件（`<表>.<页号>.<代数>.page.json`，默认 512 行/页，可构造参数调整）
-- **增量写**：`writeRows` 在引擎内部做 diff——行数不变（原地更新）时逐页独立比较，只重写有差异的页（与行的位置无关）；行数变化（插入/删除）时从首个差异行保守重写到表尾。`setAutoIncrement` 只重写 meta
+- **增量写**：`writeRows` 在引擎内部做 diff——行数不变（原地更新）时逐页独立比较，只重写有差异的页（与行的位置无关）；行数变化（插入）时从首个差异行保守重写到表尾。`setAutoIncrement` 只重写 meta
+- **墓碑删除（页槽复用）**：`deleteRows(db, table, indices)` 按稠密行号删除——被删槽位置为页内 null（墓碑），**只重写所在页**；死槽 ≥ 40% 且 ≥ 100 行时自动压实（全量重排、墓碑清零），任何 `writeRows` 全量替换后墓碑清零；读取恒返回压缩后的稠密行序列，外部视角不变
 - **崩溃安全**：写入顺序为"新代数页文件（各自原子写）→ meta 原子替换（提交点）→ 清理旧代数页"。meta 是唯一事实源：崩溃在任何点，要么 meta 未变（新页成孤儿，加载时清理），要么 meta 已变（新页必已全部落盘）
 - 代价：批量全量写入比单文件略慢（多页文件系统调用）；页间无压缩
 
 基准（5 万行、按主键更新单行、100 次）：单文件 JSON 引擎 ~8.2s、serialize 引擎 ~3.5s、PagedJsonEngine ~0.4s（约 4ms/次）。
+基准（5 万行、删除中间 1 行）：墓碑路径 ~3.4ms vs 原 suffix 重写 ~62.8ms（约 18×）。
 
 ```php
 use Kingbes\Psql\Connection;
@@ -78,6 +98,15 @@ use Kingbes\Psql\Storage\PagedJsonEngine;
 $db = new Connection(new PagedJsonEngine('/data/appdb'));      // 默认 512 行/页
 $db = new Connection(new PagedJsonEngine('/data/appdb', 1024)); // 自定义页大小
 ```
+
+### 目录锁（多进程防护）
+
+`Storage\DirectoryLock` 提供数据目录级排他锁，防止多进程数据竞争：
+
+- 文件引擎（`FileEngine` 基类，即 JsonFile/PhpSerialize）与 `PagedJsonEngine` 构造时对 `<root>/.lock` 取 `flock` 排他锁
+- **跨进程互斥**：锁被其他进程持有时构造抛 `StorageException`（消息含 root）
+- **同进程引用计数**：同进程多次打开同 root 允许；但两个实例的内存缓存彼此独立，分别写盘可能读到陈旧数据——同进程需要多连接时应避免并行写同一表
+- `MemoryEngine` 无锁；`.lock` 不是数据文件，不参与表枚举
 
 ### 事务与快照
 
@@ -121,7 +150,7 @@ use Kingbes\Psql\Storage\StorageEngine;
 
 final class MyEngine implements StorageEngine
 {
-    // 实现全部接口方法：数据库/表的 CRUD、readRows/writeRows、
+    // 实现全部接口方法：数据库/表的 CRUD、readRows/writeRows/deleteRows、
     // autoIncrement/setAutoIncrement/resetAutoIncrement、
     // snapshot/restore/persist
 }
@@ -131,14 +160,15 @@ $connection = new Connection(new MyEngine());
 
 要点：
 
-- `readRows`/`writeRows` 为全量读写语义（v1 无行级游标）
+- `readRows`/`writeRows` 为全量读写语义（v1 无行级游标）；`deleteRows` 按稠密行号删除（v1.2 新增）——`FileEngine`/`MemoryEngine` 提供通用默认实现（语义等同过滤后重写），仅 `PagedJsonEngine` 有页槽墓碑收益
 - `snapshot`/`restore` 必须覆盖引擎全部状态（事务依赖它回滚 DDL）
 - 名称校验（库名/表名 `^[A-Za-z_][A-Za-z0-9_]*$`）防止路径穿越，自定义引擎应保留同类校验
 - 测试上可复用 `tests/Unit/Storage/StorageEngineContractTestCase.php` 契约基类验证实现正确性
 
-## v1 范围外（路线图）
+## 范围外（路线图）
 
 - SQL 字符串解析器（`$db->query("SELECT ...")`）
-- 二级索引 / B-Tree（当前线性扫描）
+- B-Tree / 范围索引（当前哈希二级索引仅覆盖等值查询，范围查询仍扫描）
+- 排序外部归并（大表 ORDER BY 仍内存排序）
 - 视图、存储过程、触发器、MVCC 并发、连接池
-- 排序规则（collation）配置、JSON 列类型
+- 完整 collation 体系（现仅列级 `ci()`）、JSON 列类型

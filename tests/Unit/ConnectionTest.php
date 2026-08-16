@@ -7,6 +7,7 @@ namespace Kingbes\Psql\Tests\Unit;
 use Kingbes\Psql\Connection;
 use Kingbes\Psql\Exception\QueryException;
 use Kingbes\Psql\Exception\SchemaException;
+use Kingbes\Psql\Exception\StorageException;
 use Kingbes\Psql\Psql;
 use Kingbes\Psql\Query\Table;
 use Kingbes\Psql\Schema\AlterBlueprint;
@@ -425,6 +426,217 @@ final class ConnectionTest extends TestCase
             [['id' => 1, 'name' => '张三']],
             $reopened->engine()->readRows('main', 'users')
         );
+    }
+
+    // ---- 索引 DDL ----
+
+    public function testIndexLifecycle(): void
+    {
+        $connection = Psql::memory();
+        $connection->createTable('users', static function (Blueprint $table): void {
+            $table->id();
+            $table->varchar('email', 100);
+            $table->varchar('name', 50);
+        });
+
+        $this->assertFalse($connection->hasIndex('users', 'idx_email'));
+
+        $connection->createIndex('users', 'idx_email', 'email');
+
+        $this->assertTrue($connection->hasIndex('users', 'idx_email'));
+        $schema = $connection->engine()->loadSchema('main', 'users');
+        $this->assertCount(1, $schema->indexes);
+        $this->assertSame('idx_email', $schema->indexes[0]->name);
+        $this->assertSame(['email'], $schema->indexes[0]->columns);
+
+        $connection->dropIndex('users', 'idx_email');
+
+        $this->assertFalse($connection->hasIndex('users', 'idx_email'));
+        $this->assertSame([], $connection->engine()->loadSchema('main', 'users')->indexes);
+    }
+
+    public function testCreateTableWithBlueprintIndexes(): void
+    {
+        $connection = Psql::memory();
+        $connection->createTable('users', static function (Blueprint $table): void {
+            $table->id();
+            $table->varchar('email', 100);
+            $table->index('email');
+        });
+
+        $schema = $connection->engine()->loadSchema('main', 'users');
+
+        $this->assertCount(1, $schema->indexes);
+        $this->assertSame('idx_email', $schema->indexes[0]->name);
+        $this->assertSame(['email'], $schema->indexes[0]->columns);
+        $this->assertTrue($connection->hasIndex('users', 'idx_email'));
+    }
+
+    public function testCreateIndexDuplicateNameThrows(): void
+    {
+        $connection = Psql::memory();
+        $connection->createTable('users', self::usersDefinition());
+        $connection->createIndex('users', 'idx_name', 'name');
+
+        $this->expectException(SchemaException::class);
+        $this->expectExceptionMessage('idx_name');
+        $connection->createIndex('users', 'idx_name', 'name');
+    }
+
+    public function testCreateIndexDuplicateColumnsThrows(): void
+    {
+        $connection = Psql::memory();
+        $connection->createTable('users', self::usersDefinition());
+
+        $this->expectException(SchemaException::class);
+        $connection->createIndex('users', 'idx_dup', 'name', 'name');
+    }
+
+    public function testCreateIndexEmptyColumnsThrows(): void
+    {
+        $connection = Psql::memory();
+        $connection->createTable('users', self::usersDefinition());
+
+        $this->expectException(SchemaException::class);
+        $connection->createIndex('users', 'idx_empty');
+    }
+
+    public function testCreateIndexMissingColumnThrows(): void
+    {
+        $connection = Psql::memory();
+        $connection->createTable('users', self::usersDefinition());
+
+        $this->expectException(SchemaException::class);
+        $this->expectExceptionMessage('ghost');
+        $connection->createIndex('users', 'idx_ghost', 'ghost');
+    }
+
+    public function testCreateIndexInvalidNameThrows(): void
+    {
+        $connection = Psql::memory();
+        $connection->createTable('users', self::usersDefinition());
+
+        foreach (['1bad', 'bad-name', 'bad name'] as $name) {
+            try {
+                $connection->createIndex('users', $name, 'name');
+                $this->fail("非法索引名 {$name} 应抛 SchemaException");
+            } catch (SchemaException $e) {
+                $this->addToAssertionCount(1);
+            }
+        }
+    }
+
+    public function testDropIndexMissingThrows(): void
+    {
+        $connection = Psql::memory();
+        $connection->createTable('users', self::usersDefinition());
+
+        $this->expectException(SchemaException::class);
+        $connection->dropIndex('users', 'idx_missing');
+    }
+
+    public function testIndexDdlOnMissingTableThrowsStorageException(): void
+    {
+        $connection = Psql::memory();
+
+        try {
+            $connection->createIndex('ghost', 'idx_a', 'a');
+            $this->fail('表不存在 createIndex 应抛 StorageException');
+        } catch (StorageException $e) {
+            $this->addToAssertionCount(1);
+        }
+        try {
+            $connection->dropIndex('ghost', 'idx_a');
+            $this->fail('表不存在 dropIndex 应抛 StorageException');
+        } catch (StorageException $e) {
+            $this->addToAssertionCount(1);
+        }
+
+        $this->expectException(StorageException::class);
+        $connection->hasIndex('ghost', 'idx_a');
+    }
+
+    public function testIndexPersistenceAcrossConnections(): void
+    {
+        $connection = Psql::connect($this->root);
+        $connection->createTable('users', static function (Blueprint $table): void {
+            $table->id();
+            $table->varchar('email', 100);
+            $table->varchar('name', 50);
+        });
+        $connection->createIndex('users', 'idx_email_name', 'email', 'name');
+        $connection->engine()->persist();
+
+        // 重开后索引完整
+        $reopened = Psql::connect($this->root);
+        $this->assertTrue($reopened->hasIndex('users', 'idx_email_name'));
+        $index = $reopened->engine()->loadSchema('main', 'users')->indexes[0];
+        $this->assertSame('idx_email_name', $index->name);
+        $this->assertSame(['email', 'name'], $index->columns);
+
+        $reopened->dropIndex('users', 'idx_email_name');
+        $reopened->engine()->persist();
+
+        // 再次重开确认消失
+        $again = Psql::connect($this->root);
+        $this->assertFalse($again->hasIndex('users', 'idx_email_name'));
+        $this->assertSame([], $again->engine()->loadSchema('main', 'users')->indexes);
+    }
+
+    public function testAlterTablePreservesIndexesAfterAddColumn(): void
+    {
+        $connection = Psql::memory();
+        $connection->createTable('users', static function (Blueprint $table): void {
+            $table->id();
+            $table->varchar('name', 50)->notNull();
+            $table->index('name');
+        });
+
+        $connection->alterTable('users', static function (AlterBlueprint $table): void {
+            $table->int('age');
+        });
+
+        $this->assertTrue($connection->hasIndex('users', 'idx_name'));
+        $this->assertSame(['name'], $connection->engine()->loadSchema('main', 'users')->indexes[0]->columns);
+    }
+
+    public function testAlterTableRenameColumnSyncsIndexColumns(): void
+    {
+        $connection = Psql::memory();
+        $connection->createTable('users', static function (Blueprint $table): void {
+            $table->id();
+            $table->varchar('name', 50)->notNull();
+            $table->index('name');
+        });
+
+        $connection->alterTable('users', static function (AlterBlueprint $table): void {
+            $table->renameColumn('name', 'username');
+        });
+
+        $index = $connection->engine()->loadSchema('main', 'users')->indexes[0];
+        $this->assertSame('idx_name', $index->name);
+        $this->assertSame(['username'], $index->columns);
+    }
+
+    public function testAlterTableDropIndexedColumnThrows(): void
+    {
+        $connection = Psql::memory();
+        $connection->createTable('users', static function (Blueprint $table): void {
+            $table->id();
+            $table->varchar('name', 50)->notNull();
+            $table->index('name');
+        });
+
+        try {
+            $connection->alterTable('users', static function (AlterBlueprint $table): void {
+                $table->dropColumn('name');
+            });
+            $this->fail('删除被索引引用的列应抛 SchemaException');
+        } catch (SchemaException $e) {
+            $this->assertStringContainsString('idx_name', $e->getMessage());
+        }
+        // 结构未变，索引保留
+        $this->assertTrue($connection->hasIndex('users', 'idx_name'));
     }
 
     // ---- 辅助 ----

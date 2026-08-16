@@ -10,6 +10,7 @@ use Kingbes\Psql\Schema\Blueprint;
 use Kingbes\Psql\Schema\ColumnSchema;
 use Kingbes\Psql\Schema\DataType;
 use Kingbes\Psql\Schema\ForeignKey;
+use Kingbes\Psql\Schema\ForeignKeyAction;
 use Kingbes\Psql\Schema\TableSchema;
 use PHPUnit\Framework\TestCase;
 
@@ -84,7 +85,8 @@ final class BlueprintTest extends TestCase
         $this->assertSame('user_id', $fk->column);
         $this->assertSame('users', $fk->refTable);
         $this->assertSame('id', $fk->refColumn);
-        $this->assertTrue($fk->onDeleteCascade);
+        $this->assertSame(ForeignKeyAction::CASCADE, $fk->onDelete);
+        $this->assertSame(ForeignKeyAction::RESTRICT, $fk->onUpdate);
     }
 
     public function testForeignKeyWithoutReferencesThrows(): void
@@ -160,14 +162,21 @@ final class BlueprintTest extends TestCase
         $blueprint->enum('status', ['a', 'b', 'a']);
     }
 
-    public function testMultiplePrimaryKeysThrows(): void
+    public function testCompositePrimaryKeyProducesTwoColumns(): void
     {
         $blueprint = new Blueprint();
-        $blueprint->id();
-        $blueprint->int('b')->primaryKey();
+        $blueprint->int('a');
+        $blueprint->int('b');
+        $blueprint->primary('a', 'b');
 
-        $this->expectException(SchemaException::class);
-        $blueprint->toSchema('t');
+        $schema = $blueprint->toSchema('t');
+
+        // 复合主键：primaryKeyColumns 保持定义序收录两列，primaryKey() 无单列语义
+        $this->assertSame(['a', 'b'], array_map(
+            static fn (ColumnSchema $column): string => $column->name,
+            $schema->primaryKeyColumns(),
+        ));
+        $this->assertNull($schema->primaryKey());
     }
 
     public function testInvalidColumnNameThrows(): void
