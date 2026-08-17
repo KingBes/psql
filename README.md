@@ -2,7 +2,8 @@
 
 一个纯 PHP 实现的本地 SQL 数据库引擎——不需要 MySQL 服务器，不需要任何扩展依赖，数据存在本地文件或纯内存中。
 
-设计目标：**语义与使用习惯向 MySQL 看齐（数据类型、约束、JOIN、事务），查询语言以 PHP OOP 链式 API 表达**。相当于"PHP 版 SQLite，MySQL 方言设计，OOP 接口"。
+设计目标：**语义与使用习惯向 MySQL 看齐（数据类型、约束、JOIN、事务），查询语言以 PHP OOP 链式 API 表达**。
+相当于"PHP 版 SQLite，MySQL 方言设计，OOP 接口"。
 
 ```php
 use Kingbes\Psql\Psql;
@@ -64,12 +65,6 @@ composer require kingbes/psql
 ```
 
 ## 快速开始
-
-```bash
-git clone <your-repo-url> psql
-cd psql
-composer install
-```
 
 ```php
 require __DIR__ . '/vendor/autoload.php';
