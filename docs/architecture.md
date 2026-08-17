@@ -21,10 +21,10 @@
 | `src/Exception/` | 异常体系：`PsqlException`（抽象基类）+ 六个具体异常 |
 | `src/Schema/` | `Blueprint` 建表 DSL、`ColumnSchema`/`TableSchema`（readonly 不可变结构）、`ForeignKey`、`AlterBlueprint` |
 | `src/Type/` | `ValueCaster`：PHP 值 → 列类型的校验与规范化 |
-| `src/Query/` | `Table` 表访问入口、`SelectBuilder` 链式构建器、`Condition/` 条件模型、`ConditionEvaluator` 条件求值、`Agg` 聚合工厂、`Func`/`CaseWhen`/`ColumnRef` 投影表达式、`SelectQuery` 等 DTO |
-| `src/Execution/` | `Writer`（INSERT/UPDATE/DELETE 约束管线）、`Executor`（SELECT 流水线）、`IndexManager`（哈希索引缓存与预过滤）、`SubqueryResolver`（子查询解析） |
+| `src/Query/` | `Table` 表访问入口、`SelectBuilder` 链式构建器、`Condition/` 条件模型、`ConditionEvaluator` 条件求值、`Agg` 聚合工厂、`Func`/`CaseWhen`/`ColumnRef` 投影表达式、`ViewDefinition`（视图定义 DTO 与结构化序列化）、`Explain`（静态计划分析）、`SelectQuery` 等 DTO |
+| `src/Execution/` | `Writer`（INSERT/UPDATE/DELETE 约束管线）、`Executor`（SELECT 流水线）、`IndexManager`（哈希索引缓存与预过滤）、`SubqueryResolver`（子查询解析）、`TriggerManager`/`Trigger`（触发器分发与句柄） |
 | `src/Result/` | `ResultSet` 结果集、`InsertResult` 插入结果 |
-| `src/Storage/` | `StorageEngine` 接口、`MemoryEngine`、`JsonFileEngine`、`PagedJsonEngine`、`DirectoryLock`、`EngineSnapshot` |
+| `src/Storage/` | `StorageEngine` 接口、`MemoryEngine`、`JsonFileEngine`、`PagedJsonEngine`、`Codec`（压缩/加密编解码层）、`DirectoryLock`、`EngineSnapshot` |
 
 ## 执行模型
 
@@ -34,7 +34,9 @@
 - **子查询**：`whereIn`/`whereNotIn`/`whereExists`/`whereNotExists` 传入的子构建器经 `Execution\SubqueryResolver` 解析——作为独立查询完整执行（含自身 orderBy/limit/union）后，结果化为值列表或存在性判定进入常规条件求值；不支持相关子查询（引用外层列即未知列异常）
 - **UNION / UNION ALL**：各子方作为独立查询完整执行（保留各自排序/limit 语义）后由 `Executor` 按声明序合并——UNION 全集去重保首见顺序、UNION ALL 保留重复；外层收尾子句（distinct/orderBy/limit/offset）作用于合并结果
 - **表达式投影**：`Query\ProjectionExpression` 接口（`Func`/`CaseWhen`/`ColumnRef` 实现）在投影阶段对源限定行求值，支持任意嵌套（NULL 传播、coalesce 除外）；别名进入输出行，可被 orderBy/having/groupBy 引用
-- 写入路径的外键策略分发（DELETE/UPDATE 四策略）与 CHECK 约束求值均在 `Writer` 约束管线内完成
+- **视图**：视图查询即把存储的结构化定义（`Query\ViewDefinition`）**水化**为 `SelectBuilder`，走与手写查询完全相同的常规流水线——没有独立的视图执行器
+- **EXPLAIN**：`Query\Explain` 为**静态镜像分析**——只读 schema 与存储行数做访问路径判定，不执行查询本体；索引触发条件、CI 列跳过索引与 hash join 的判定逻辑与 `Executor` 实际分派保持镜像同步
+- 写入路径的外键策略分发（DELETE/UPDATE 四策略）与 CHECK 约束求值均在 `Writer` 约束管线内完成；触发器分发（`Execution\TriggerManager`）同样挂在 `Writer` 管线的关键位置——BEFORE INSERT/UPDATE 在 cast 前取行（返回值进入管线）、AFTER 在约束全部通过后收到最终行、DELETE 前后各一档；分发点首行判空直通，**无注册触发器时写路径零开销**
 
 ### IndexManager（等值索引预过滤）
 
@@ -58,7 +60,7 @@
 
 ### JsonFileEngine
 
-- 磁盘布局：`<root>/<数据库>/<表>.json`
+- 磁盘布局：`<root>/<数据库>/<表>.json`；视图定义存库目录 `.views.json`（带前导点避免与名为 `views` 的表文件冲突，同样原子写）
 - 每个表文件内容：`{"schema": {...}, "auto_increment": int, "rows": [...]}`
 - **原子写入**：先写 `<表>.json.tmp.<uniqid>` 临时文件，再 rename 替换；任何 IO 失败抛 `StorageException`
 - **写穿缓存**：内存缓存为运行时事实源，每次写操作同步落盘；懒加载首次访问的表；损坏 JSON / 结构缺键在读取时抛 `StorageException`（消息含文件路径）
@@ -99,6 +101,48 @@ $db = new Connection(new PagedJsonEngine('/data/appdb'));      // 默认 512 行
 $db = new Connection(new PagedJsonEngine('/data/appdb', 1024)); // 自定义页大小
 ```
 
+### Codec 层（静态压缩与加密）
+
+`Storage\Codec` 是文件引擎的载荷编解码横切层，由 `Psql::connect` 选项驱动：
+
+```php
+use Kingbes\Psql\Psql;
+
+$db = Psql::connect('/data/appdb');                                        // 明文（默认）
+$db = Psql::connect('/data/appdb', ['compress' => true]);                  // gzip 压缩落盘
+$db = Psql::connect('/data/appdb', ['key' => 'secret']);                   // AES-256-CBC 加密落盘
+$db = Psql::connect('/data/appdb', ['compress' => true, 'key' => 'secret']); // 先压缩后加密
+```
+
+| 连接选项 | 类型 | 作用 |
+|---|---|---|
+| `compress` | bool | 落盘载荷经 `gzencode` 压缩，magic 头 `PGZ\x01` |
+| `key` | ?string | 落盘载荷 AES-256-CBC 加密，magic 头 `PENC\x01`（需 openssl 扩展） |
+
+- **magic 头版本化**：每份落盘载荷带 4 字节 magic 标识格式（明文为空 magic），格式演进有据可依
+- **读侧自适应**：decode 始终按 magic 自动分派解压/解密，**配置只影响写方向**——旧明文库不带选项照常可读；开启压缩/加密后写回**渐进**迁移到新格式（同库明文/压缩/加密文件混存完全合法）。读加密库须提供原 key
+- **加密布局**：`PENC\x01 + hmac(16B) + iv(16B) + ciphertext`——key 经 sha256 派生 AES-256 密钥，IV 每次随机生成；HMAC-SHA256 截断 16 字节做完整性校验（`hash_equals` 恒时比较）。错 key 或 HMAC 篡改抛 `StorageException`（"密钥错误或数据损坏"）；无 key 打开加密库抛"文件已加密，需要密钥"
+- **叠加顺序**：两项同时开启时**先压缩后加密**（压缩先消除明文冗余，再加密保障静态安全）
+- **openssl 前置检查**：配置 key 且 openssl 扩展不可用时，引擎构造即抛 `StorageException`（"openssl 扩展不可用"）
+- **Memory 引擎**：无落盘无 codec，`Psql::memory()` 传入 `compress` / `key` 选项抛 `InvalidArgumentException`
+- **引擎接入点**：`FileEngine` 的表文件 / 视图目录读写共 5 个 I/O 点统一过 codec；`PagedJsonEngine` 全部落盘收敛在 atomicWrite 单点 encode、各加载路径（meta / 页 / 视图）按 magic decode
+- **锁文件排除**：`.lock` 是运行时协调文件，不经 codec（不压缩不加密）
+
+### 备份（backup API）
+
+```php
+$db->backup('/data/backup-' . date('Y-m-d'));              // 当前库完整快照导出
+
+$restored = Psql::connect('/data/backup-2026-08-17');      // 备份目录即合法库目录，直接打开
+```
+
+- `Connection::backup(string $targetDir): void`——委托引擎接口 `StorageEngine::backupDatabase(string $database, string $targetDir): void`（**v2.1 BC 断点**：自定义引擎须补实现该方法）
+- **tmp + rename 原子语义**：每个文件先写目标目录下临时文件再 rename 就位；目标目录须**不存在或为空目录**，否则抛 `StorageException`
+- **写穿模型下直接拷贝即一致性快照**：syncDisk 是"缓存即事实源"语义的同步原语（写穿模型下每次写已同步落盘），备份路径不调用 syncDisk——直接拷贝落盘文件即得一致视图
+- 活动事务中调用抛 `TransactionException`；`MemoryEngine` 无落盘不支持（抛 `StorageException`）
+- **排除锁文件**：`.lock` 不随备份复制
+- 加密库的备份同为密文，重新打开需提供原 key
+
 ### 目录锁（多进程防护）
 
 `Storage\DirectoryLock` 提供数据目录级排他锁，防止多进程数据竞争：
@@ -110,7 +154,7 @@ $db = new Connection(new PagedJsonEngine('/data/appdb', 1024)); // 自定义页�
 
 ### 事务与快照
 
-`StorageEngine::snapshot(): EngineSnapshot` 对引擎全量状态序列化（文件引擎快照前会加载磁盘上尚未访问的表），`restore()` 恢复并同步磁盘（删除快照外文件），供 `Connection::begin()/rollBack()` 使用。
+`StorageEngine::snapshot(): EngineSnapshot` 对引擎全量状态序列化（文件引擎快照前会加载磁盘上尚未访问的表；v2.0 起快照载荷还包含各库**视图目录**，事务内建/删视图可回滚），`restore()` 恢复并同步磁盘（删除快照外文件），供 `Connection::begin()/rollBack()` 与 savepoint（`savepoint`/`rollBackTo`/`releaseSavepoint`）使用。
 
 ## 异常体系
 
@@ -152,6 +196,8 @@ final class MyEngine implements StorageEngine
 {
     // 实现全部接口方法：数据库/表的 CRUD、readRows/writeRows/deleteRows、
     // autoIncrement/setAutoIncrement/resetAutoIncrement、
+    // loadViewDefinitions/saveViewDefinitions（v2.0 新增）、
+    // backupDatabase（v2.1 新增）、
     // snapshot/restore/persist
 }
 
@@ -160,8 +206,10 @@ $connection = new Connection(new MyEngine());
 
 要点：
 
+- **v2.0 BC 断点**：接口新增 `loadViewDefinitions(string $database): array` / `saveViewDefinitions(string $database, array $definitions): void`——v1.x 的第三方引擎必须补实现这两个方法才能升级（定义载荷为 `ViewDefinition::toArray()` 产出的结构化数组）
+- **v2.1 BC 断点**：接口新增 `backupDatabase(string $database, string $targetDir): void`——v2.0 的第三方引擎须补实现才能升级（文件型引擎可继承 `FileEngine` 免费获得 tmp+rename 拷贝实现；纯内存语义可参照 `MemoryEngine` 抛 `StorageException`）
 - `readRows`/`writeRows` 为全量读写语义（v1 无行级游标）；`deleteRows` 按稠密行号删除（v1.2 新增）——`FileEngine`/`MemoryEngine` 提供通用默认实现（语义等同过滤后重写），仅 `PagedJsonEngine` 有页槽墓碑收益
-- `snapshot`/`restore` 必须覆盖引擎全部状态（事务依赖它回滚 DDL）
+- `snapshot`/`restore` 必须覆盖引擎全部状态（事务依赖它回滚 DDL；v2.0 起须含视图目录）
 - 名称校验（库名/表名 `^[A-Za-z_][A-Za-z0-9_]*$`）防止路径穿越，自定义引擎应保留同类校验
 - 测试上可复用 `tests/Unit/Storage/StorageEngineContractTestCase.php` 契约基类验证实现正确性
 
@@ -170,5 +218,5 @@ $connection = new Connection(new MyEngine());
 - SQL 字符串解析器（`$db->query("SELECT ...")`）
 - B-Tree / 范围索引（当前哈希二级索引仅覆盖等值查询，范围查询仍扫描）
 - 排序外部归并（大表 ORDER BY 仍内存排序）
-- 视图、存储过程、触发器、MVCC 并发、连接池
+- 存储过程、MVCC 并发、连接池（视图与触发器已于 v2.0 交付）
 - 完整 collation 体系（现仅列级 `ci()`）、JSON 列类型

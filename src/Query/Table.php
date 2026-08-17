@@ -6,6 +6,7 @@ namespace Kingbes\Psql\Query;
 
 use Kingbes\Psql\Connection;
 use Kingbes\Psql\Exception\QueryException;
+use Kingbes\Psql\Execution\Executor;
 use Kingbes\Psql\Execution\Writer;
 use Kingbes\Psql\Result\InsertResult;
 use Kingbes\Psql\Result\ResultSet;
@@ -112,6 +113,64 @@ final class Table
     public function insertIgnore(array $row): int
     {
         return (new Writer($this->requireConnection()))->insertIgnore($this->name, $this->alias, $row);
+    }
+
+    /**
+     * 把一个查询的结果集插入本表（INSERT ... SELECT）：
+     * 子查询输出列须与本表列名匹配（子集也可——未覆盖列走 DEFAULT/NOT NULL 校验）；
+     * 子查询引用本表自身（基表/join/union 递归）抛 QueryException（自插入语义不明）；
+     * 返回插入行数（0 行结果集返回 0，不算错误——空集跳过列校验，无从判断）；
+     * 任一行失败整体不写入（复用 insertMany 批内原子：cast/约束/唯一/外键/CHECK/触发器全生效）
+     */
+    public function insertSelect(SelectBuilder $source): int
+    {
+        $connection = $this->requireConnection();
+        $query = $source->toQuery();
+        $this->assertInsertSelectNoSelfReference($query);
+
+        $rows = (new Executor($connection))->execute($query)->rows();
+        if ($rows === []) {
+            return 0;
+        }
+
+        // 列匹配校验：源行键集须为本表列子集（未知列抛 QueryException，消息含差集）
+        $schema = $connection->engine()->loadSchema($connection->currentDatabase(), $this->name);
+        foreach ($rows as $row) {
+            $unknown = [];
+            foreach (array_keys($row) as $key) {
+                if (!$schema->hasColumn((string) $key)) {
+                    $unknown[] = (string) $key;
+                }
+            }
+            if ($unknown !== []) {
+                throw new QueryException(
+                    'INSERT ... SELECT 源列不存在于目标表 ' . $this->name . ': ' . implode(', ', $unknown)
+                );
+            }
+        }
+
+        return (new Writer($connection))->insert($this->name, $this->alias, $rows)->rowCount();
+    }
+
+    /**
+     * REPLACE INTO（MySQL 语义）：无唯一冲突直接插入返回 1；
+     * 唯一冲突（主键/unique，含复合元组）先删旧行再插入新行，返回删除 + 插入合计（冲突时为 2）
+     *
+     * @param array<string,mixed> $row
+     */
+    public function replace(array $row): int
+    {
+        return (new Writer($this->requireConnection()))->replace($this->name, $this->alias, $row);
+    }
+
+    /**
+     * 批量 REPLACE：逐行独立处理（非批内原子，MySQL 语义），返回各行删除 + 插入合计
+     *
+     * @param list<array<string,mixed>> $rows
+     */
+    public function replaceMany(array $rows): int
+    {
+        return (new Writer($this->requireConnection()))->replaceMany($this->name, $this->alias, $rows);
     }
 
     /**
@@ -275,6 +334,24 @@ final class Table
     public function unionAll(SelectBuilder $query): SelectBuilder
     {
         return $this->builder()->unionAll($query);
+    }
+
+    /**
+     * INSERT ... SELECT 自引用检测：源查询的基表、join 表、union（递归）任一命中本表名即抛
+     */
+    private function assertInsertSelectNoSelfReference(SelectQuery $query): void
+    {
+        if ($query->table === $this->name) {
+            throw new QueryException('INSERT ... SELECT 不支持引用目标表自身');
+        }
+        foreach ($query->joins as $join) {
+            if ($join->table === $this->name) {
+                throw new QueryException('INSERT ... SELECT 不支持引用目标表自身');
+            }
+        }
+        foreach ($query->unions as $union) {
+            $this->assertInsertSelectNoSelfReference($union->query);
+        }
     }
 
     private function builder(): SelectBuilder

@@ -411,4 +411,71 @@ abstract class StorageEngineContractTestCase extends TestCase
         $engine->deleteRows('db', 't', [0]);
         $this->assertSame([], $engine->readRows('db', 't'));
     }
+
+    public function testViewDefinitionsRoundTrip(): void
+    {
+        $engine = $this->createEngine();
+        $engine->createDatabase('db');
+
+        // 空读：无视图时返回空数组
+        $this->assertSame([], $engine->loadViewDefinitions('db'));
+
+        // 写读往返：定义数组原样往返
+        $definitions = [
+            'adults' => ['name' => 'adults', 'query' => ['table' => 'users', 'where' => null, 'limit' => 10]],
+            'names' => ['name' => 'names', 'query' => ['table' => 'users', 'columns' => ['name'], 'distinct' => true]],
+        ];
+        $engine->saveViewDefinitions('db', $definitions);
+        $this->assertSame($definitions, $engine->loadViewDefinitions('db'));
+
+        // 全量替换语义：旧定义被覆盖
+        $engine->saveViewDefinitions('db', []);
+        $this->assertSame([], $engine->loadViewDefinitions('db'));
+
+        // 缺库抛 StorageException
+        $this->assertThrows(fn () => $engine->loadViewDefinitions('missing'), 'loadViewDefinitions 缺库未抛异常');
+        $this->assertThrows(fn () => $engine->saveViewDefinitions('missing', []), 'saveViewDefinitions 缺库未抛异常');
+    }
+
+    public function testViewDefinitionsIndependentOfTableData(): void
+    {
+        $engine = $this->createEngine();
+        $engine->createDatabase('db');
+        $engine->createTable('db', $this->makeSchema('t'));
+        $engine->writeRows('db', 't', [['id' => 1, 'name' => 'a']]);
+        $definitions = ['v' => ['name' => 'v', 'query' => ['table' => 't']]];
+        $engine->saveViewDefinitions('db', $definitions);
+
+        // 表数据/结构变更不影响视图定义；视图定义写入不影响表数据
+        $engine->writeRows('db', 't', [['id' => 2, 'name' => 'b']]);
+        $this->assertSame($definitions, $engine->loadViewDefinitions('db'));
+
+        $engine->saveViewDefinitions('db', $definitions + ['v2' => ['name' => 'v2', 'query' => ['table' => 't']]]);
+        $this->assertSame([['id' => 2, 'name' => 'b']], $engine->readRows('db', 't'));
+        $this->assertSame('t', $engine->loadSchema('db', 't')->name);
+
+        // 删库后视图定义随库移除
+        $engine->dropDatabase('db');
+        $this->assertFalse($engine->hasDatabase('db'));
+    }
+
+    public function testViewDefinitionsSnapshotRestore(): void
+    {
+        $engine = $this->createEngine();
+        $engine->createDatabase('db');
+        $definitions = ['v1' => ['name' => 'v1', 'query' => ['table' => 't']]];
+        $engine->saveViewDefinitions('db', $definitions);
+
+        $snapshot = $engine->snapshot();
+
+        // 快照后变更：新增视图并删除旧视图
+        $engine->saveViewDefinitions('db', ['v2' => ['name' => 'v2', 'query' => ['table' => 't']]]);
+
+        $engine->restore($snapshot);
+        $this->assertSame($definitions, $engine->loadViewDefinitions('db'));
+
+        // restore 后可继续正常写读
+        $engine->saveViewDefinitions('db', []);
+        $this->assertSame([], $engine->loadViewDefinitions('db'));
+    }
 }

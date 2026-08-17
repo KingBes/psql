@@ -101,6 +101,20 @@ interface StorageEngine
     public function resetAutoIncrement(string $database, string $table): void;
 
     /**
+     * 加载库的全部视图定义（无视图时空数组）；数据库不存在抛 StorageException
+     *
+     * @return array<string, array<string, mixed>> 视图名 => 定义数组（ViewDefinition::toArray 结构）
+     */
+    public function loadViewDefinitions(string $database): array;
+
+    /**
+     * 全量替换库的视图定义；数据库不存在或视图名非法抛 StorageException
+     *
+     * @param array<string, array<string, mixed>> $definitions 视图名 => 定义数组
+     */
+    public function saveViewDefinitions(string $database, array $definitions): void;
+
+    /**
      * 全引擎状态快照（所有数据库所有表）
      */
     public function snapshot(): EngineSnapshot;
@@ -114,4 +128,14 @@ interface StorageEngine
      * 确保持久化（内存引擎为空操作）
      */
     public function persist(): void;
+
+    /**
+     * 将指定数据库导出为可独立打开的备份目录（复制库目录全部文件，排除锁文件与临时残留）；
+     * 备份目录即合法库根目录（含同名数据库子目录），可直接用于建立引擎连接；
+     * 加密库的备份同为密文（打开需原 key）
+     *
+     * 目标目录须不存在或为空目录，否则抛 StorageException；
+     * 内存引擎抛 StorageException（无落盘，不支持备份）
+     */
+    public function backupDatabase(string $database, string $targetDir): void;
 }

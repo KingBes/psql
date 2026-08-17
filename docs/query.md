@@ -284,6 +284,77 @@ $rows = $db->table('student')->select('name', 'age')->where('age', '>=', 18)
 - 各方输出列**键集必须一致**（不一致抛 `QueryException`；某方结果为空时跳过该方校验）
 - 合并后外层的 `distinct()` / `orderBy` / `limit` / `offset` 作用于合并结果
 
+## 视图 VIEW
+
+把一个查询固化为命名视图，之后按名取用：
+
+```php
+// 创建：把"user 表成年人 id+name"固化为视图 adults
+$db->createView('adults', $db->table('user')->select('id', 'name')->where('age', '>=', 18));
+
+// 查询：view() 返回可继续链式的副本
+$rows = $db->view('adults')
+    ->where('name', 'like', 'A%')     // 在视图定义之上追加条件
+    ->orderBy('id', 'DESC')
+    ->get();
+
+// 管理
+$db->hasView('adults');               // bool
+$db->views();                         // list<string>：当前库全部视图名（字典序）
+$db->dropView('adults');              // 不存在抛 SchemaException
+```
+
+- **命名空间与表互斥**：视图与表共用命名空间——名称与现存表或其他视图冲突时 `createView()` 抛 `SchemaException`（名称规则同表名）
+- **只读**：`view()` 返回 `SelectBuilder`，只有查询链式方法（where / orderBy / get 等），没有任何写入口
+- **链式副本**：每次 `view()` 调用都从存储定义重建构建器副本，后续链式条件**不影响**存储的视图定义
+- **持久化**：定义以结构化 JSON 存储——文件引擎存库目录 `.views.json`，Memory 引擎存内存；跨连接重开自动恢复
+- **事务覆盖**：事务快照包含视图目录，事务内建/删视图可随 `rollBack()` 回滚（同 DDL 语义，详见[事务文档](transactions.md)）
+- **限制**：
+  - 视图定义包含**子查询条件**（`whereIn` 子查询等）或**投影表达式**（`Func` / `CaseWhen`）时，`createView()` 抛 `QueryException`（此类定义无法结构化持久化）
+  - `renameTable()` / `dropTable()` **不联动**视图：基表删除后视图定义仍在，但 `view()->get()` 抛"表不存在"
+
+## EXPLAIN
+
+`explain()` 静态分析查询计划，返回步骤数组——**不执行查询本体**：
+
+```php
+$steps = $db->table('user')->where('email', '=', $e)->explain();
+
+// 典型输出（哈希索引命中时）：
+// [
+//     [
+//         'step'    => 'SCAN',
+//         'table'   => 'user',
+//         'via'     => 'INDEX idx_email (hash, equality)',
+//         'estRows' => 50000,            // 实际存储行数
+//         'detail'  => '哈希索引等值预过滤，候选行仍完整求值原 WHERE 兜底；...',
+//     ],
+//     ...                                // 视查询可能还有 JOIN/SORT/LIMIT 等步骤
+// ]
+```
+
+### 步骤说明
+
+| step | 含义 | 关键字段 |
+|---|---|---|
+| `SCAN` | 基表访问路径 | `via`：`INDEX <名> (hash, equality)`（命中哈希索引预过滤）或 `FULL SCAN`（全表扫描）；`estRows`：**实际存储行数** |
+| `JOIN` | 连接分派（按声明顺序逐个输出） | `type`：`HASH`（等值且两侧列均区分大小写）或 `NESTED LOOP`（非等值条件，或等值条件涉及 CI 列时回退，detail 注明原因） |
+| `SUBQUERY` | 子查询条件（`whereIn` 子查询 / `whereExists` 等）计数 | `count`：先解析为常量列表/真值再进入常规求值 |
+| `UNION` | UNION 分支 | `type`（UNION / UNION ALL）与 `order`，每方独立完整执行后合并 |
+| `AGGREGATE` | 分组聚合 | `groupBy` 分组列、`funcs` 聚合函数列表，内存分组聚合 |
+| `SORT` | 排序 | `keys` 排序键，内存排序（无外部归并） |
+| `DISTINCT` | 输出去重 | 内存去重，保持首见顺序 |
+| `LIMIT` | 分页截断 | `limit` / `offset`，排序完成后应用 |
+
+步骤按查询流水线顺序输出（SCAN → JOIN → SUBQUERY → UNION → AGGREGATE → SORT → DISTINCT → LIMIT）。
+
+### 口径与一致性保证
+
+- `estRows` 为**实际存储行数**——EXPLAIN 允许读取存储数据但不执行查询本体；哈希索引无基数统计，索引命中时 detail 注明"估算行数为实际存储行数，索引预过滤后另行求值"
+- 命中索引的展示名：显式索引取索引名、主键取 `PRIMARY`、唯一约束取 `unique:<列>` / `unique:<列,列>` 前缀
+- **与实际执行镜像同步**：索引触发条件、CI 列跳过索引预过滤与 hash join 的判定逻辑与 `Executor` 实际分派保持镜像实现——EXPLAIN 展示的访问路径即真实执行路径，无独立的"估算器偏差"
+- 基表不存在时透传底层存储异常；表存在但 WHERE 引用未知列等执行期错误不在静态分析范围内
+
 ## 结果集 ResultSet
 
 `get()` 返回 `Kingbes\Psql\Result\ResultSet`：

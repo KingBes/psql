@@ -48,6 +48,21 @@ $db->table('user')->count();                       // 1
 $db->table('user')->insert(['name' => 'Carol']);   // id = 2（计数已随快照恢复）
 ```
 
+## 保存点 SAVEPOINT（v2.0）
+
+事务内可用命名保存点做部分回滚（详细语义与示例见[写入文档](write.md#事务与-savepoint)）：
+
+```php
+$db->begin();
+$db->savepoint('sp1');       // 建立保存点（快照压栈）；同名覆盖
+$db->rollBackTo('sp1');      // 回滚到该点：撤销其后变更、丢弃更内层保存点；该点保留可重复回滚
+$db->releaseSavepoint('sp1');    // 释放保存点（不改数据）；外层释放时内层一并失效
+```
+
+- 三方法在事务外调用抛 `TransactionException`；`commit()` / `rollBack()` 清空保存点栈
+- 保存点快照同样覆盖 DDL 与视图目录——事务内建/删表、建/删视图均可部分回滚
+- `rollBackTo` 后索引缓存自动失效重建
+
 ## 限制（v1 文档化）
 
 - **单进程模型**：无并发控制、无锁、无隔离级别配置——psql 运行在单个 PHP 进程内，同一数据目录不应被多个进程同时打开

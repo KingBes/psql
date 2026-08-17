@@ -64,6 +64,29 @@ final class SelectBuilder
     }
 
     /**
+     * 从视图定义水化为可继续链式的构建器（每次调用独立实例，链式操作不影响存储定义）
+     */
+    public static function fromDefinition(Connection $connection, ViewDefinition $definition): self
+    {
+        $query = $definition->toQuery();
+        $builder = new self($connection, $query->table, $query->alias);
+        $builder->columns = $query->columns;
+        $builder->joins = $query->joins;
+        $builder->aggregates = $query->aggregates;
+        $builder->expressions = $query->expressions;
+        $builder->groupBy = $query->groupBy;
+        $builder->where = $query->where;
+        $builder->having = $query->having;
+        $builder->orderBy = $query->orderBy;
+        $builder->distinct = $query->distinct;
+        $builder->limit = $query->limit;
+        $builder->offset = $query->offset;
+        $builder->unions = $query->unions;
+
+        return $builder;
+    }
+
+    /**
      * 追加输出列（字符串列名/聚合表达式/投影表达式混用）
      */
     public function select(string|AggregateExpression|ProjectionExpression ...$columns): static
@@ -367,6 +390,16 @@ final class SelectBuilder
     }
 
     /**
+     * EXPLAIN：静态分析当前查询的访问路径（扫描/索引、JOIN 方式、排序等步骤列表，不执行查询本体）
+     *
+     * @return list<array<string, string|int>>
+     */
+    public function explain(): array
+    {
+        return Explain::of($this->requireConnection(), $this->toQuery());
+    }
+
+    /**
      * 取结果集第一行，无结果返回 null
      */
     public function first(): ?array
@@ -435,19 +468,27 @@ final class SelectBuilder
     }
 
     /**
-     * 按当前 where 条件更新，返回影响行数
+     * 按当前 where 条件更新，返回影响行数；
+     * 链式带 orderBy/limit 时为 MySQL UPDATE ... ORDER BY ... LIMIT 语义（matched 排序后取前 limit 行更新）
      */
     public function update(array $values): int
     {
-        return (new Writer($this->requireConnection()))->update($this->table, $this->alias, $this->where, $values);
+        [$orderBy, $limit] = $this->writeOrderLimit();
+
+        return (new Writer($this->requireConnection()))
+            ->update($this->table, $this->alias, $this->where, $values, $orderBy, $limit);
     }
 
     /**
-     * 按当前 where 条件删除，返回影响行数
+     * 按当前 where 条件删除，返回影响行数；
+     * 链式带 orderBy/limit 时为 MySQL DELETE ... ORDER BY ... LIMIT 语义（matched 排序后取前 limit 行删除）
      */
     public function delete(): int
     {
-        return (new Writer($this->requireConnection()))->delete($this->table, $this->alias, $this->where);
+        [$orderBy, $limit] = $this->writeOrderLimit();
+
+        return (new Writer($this->requireConnection()))
+            ->delete($this->table, $this->alias, $this->where, $orderBy, $limit);
     }
 
     public function count(): int
@@ -479,6 +520,32 @@ final class SelectBuilder
     public function max(string $column): mixed
     {
         return $this->aggregateValueOrThrow(Agg::max($column));
+    }
+
+    /**
+     * 写链式（UPDATE/DELETE 终结）的排序/限量状态提取：
+     * - 链式带 offset 抛 QueryException（MySQL UPDATE/DELETE 不支持 OFFSET）
+     * - 带 orderBy/limit 时仅允许 where/orderBy/limit 链式——聚合/投影表达式/join/group/having/distinct/union
+     *   场景输出行与基表行号无法一一对应，抛 QueryException
+     * - 无 orderBy/limit 时返回 [null, null]（走既有写路径，行为与之前完全一致）
+     *
+     * @return array{0: list<array{column: string, direction: 'ASC'|'DESC'}>|null, 1: int|null}
+     */
+    private function writeOrderLimit(): array
+    {
+        if ($this->offset !== null) {
+            throw new QueryException('UPDATE/DELETE 不支持 OFFSET');
+        }
+        if ($this->orderBy === [] && $this->limit === null) {
+            return [null, null];
+        }
+        if ($this->aggregates !== [] || $this->expressions !== [] || $this->joins !== []
+            || $this->groupBy !== [] || $this->having !== null || $this->distinct || $this->unions !== []
+        ) {
+            throw new QueryException('UPDATE/DELETE 带 ORDER BY/LIMIT 时仅支持 where/orderBy/limit 链式');
+        }
+
+        return [$this->orderBy === [] ? null : $this->orderBy, $this->limit];
     }
 
     /**

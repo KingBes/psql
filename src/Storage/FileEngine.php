@@ -15,13 +15,30 @@ use Kingbes\Psql\Schema\TableSchema;
 abstract class FileEngine implements StorageEngine
 {
     /**
+     * 视图定义文件名（库目录下）
+     *
+     * 注意：带前导点是有意为之——表文件扩展名由子类决定（如 .json），
+     * 'views' 是合法表名，字面 views.json 会与同名表文件冲突；'.views' 非法表名可被各扫描自然过滤
+     */
+    private const VIEWS_FILENAME = '.views.json';
+
+    private const VIEWS_JSON_FLAGS = JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT;
+
+    /**
      * @var array<string, array<string, array{schema: TableSchema, rows: list<array<string,mixed>>, ai: int}>>
      */
     private array $cache = [];
 
+    /**
+     * 视图定义缓存：库 => 视图名 => 定义数组（写穿 + 懒加载，与表条目一致）
+     *
+     * @var array<string, array<string, array<string, mixed>>>
+     */
+    private array $viewCache = [];
+
     protected string $root;
 
-    public function __construct(string $root)
+    public function __construct(string $root, private Codec $codec = new Codec())
     {
         $this->root = rtrim($root, '/\\');
         if ($this->root === '') {
@@ -109,7 +126,7 @@ abstract class FileEngine implements StorageEngine
         if (is_dir($dir)) {
             $this->removeDirRecursive($dir);
         }
-        unset($this->cache[$database]);
+        unset($this->cache[$database], $this->viewCache[$database]);
     }
 
     public function tables(string $database): array
@@ -288,9 +305,29 @@ abstract class FileEngine implements StorageEngine
         $this->writeTableFile($database, $table);
     }
 
+    public function loadViewDefinitions(string $database): array
+    {
+        $this->assertValidName($database, '数据库');
+        $this->requireDatabase($database);
+        if (!isset($this->viewCache[$database])) {
+            $this->viewCache[$database] = $this->readViewsFile($database);
+        }
+
+        return $this->viewCache[$database];
+    }
+
+    public function saveViewDefinitions(string $database, array $definitions): void
+    {
+        $this->assertValidName($database, '数据库');
+        $this->requireDatabase($database);
+        $this->assertViewDefinitions($definitions, $database);
+        $this->viewCache[$database] = $definitions;
+        $this->writeViewsFile($database);
+    }
+
     public function snapshot(): EngineSnapshot
     {
-        // 先将磁盘上所有表加载进缓存，确保快照覆盖未加载的表
+        // 先将磁盘上所有表与视图加载进缓存，确保快照覆盖未加载的内容
         foreach ($this->databases() as $database) {
             if (!isset($this->cache[$database])) {
                 $this->cache[$database] = [];
@@ -298,25 +335,121 @@ abstract class FileEngine implements StorageEngine
             foreach ($this->tables($database) as $table) {
                 $this->loadTable($database, $table);
             }
+            $this->loadViewDefinitions($database);
         }
 
-        return new EngineSnapshot(serialize($this->cache));
+        return new EngineSnapshot(serialize(['tables' => $this->cache, 'views' => $this->viewCache]));
     }
 
     public function restore(EngineSnapshot $snapshot): void
     {
-        $state = @unserialize($snapshot->payload);
-        if (!is_array($state)) {
+        $payload = @unserialize($snapshot->payload);
+        if (!is_array($payload)
+            || !isset($payload['tables'], $payload['views'])
+            || !is_array($payload['tables'])
+            || !is_array($payload['views'])) {
             throw new StorageException('快照数据无法反序列化');
         }
-        $this->validateState($state);
-        $this->cache = $state;
+        $this->validateState($payload['tables']);
+        $this->validateViews($payload['views']);
+        $this->cache = $payload['tables'];
+        $this->viewCache = $payload['views'];
         $this->syncDisk();
     }
 
     public function persist(): void
     {
         $this->syncDisk();
+    }
+
+    public function backupDatabase(string $database, string $targetDir): void
+    {
+        $this->assertValidName($database, '数据库');
+        $this->requireDatabase($database);
+        $dir = $this->dbDir($database);
+        if (!is_dir($dir)) {
+            throw new StorageException("数据库不存在: {$database}");
+        }
+        $this->assertBackupTarget($targetDir);
+        // 引擎为写穿模型：任何变更（表数据/schema/视图）即时落盘，无需额外 flush，
+        // 直接拷贝库目录即为一致性快照（写盘中断残留的 .tmp.* 文件在拷贝时排除）
+
+        // 拷贝到临时目录后 rename：可见窗口内目标目录要么不存在要么为完整备份
+        // （rename 失败时可跨盘的场景不在本实现范围——临时目录与目标同级，必同盘）
+        $target = rtrim($targetDir, '/\\');
+        $tmp = $target . '.tmp-' . uniqid();
+        try {
+            if (!mkdir($tmp, 0777, true) && !is_dir($tmp)) {
+                throw new StorageException("无法创建备份临时目录: {$tmp}");
+            }
+            $dest = $tmp . '/' . $database;
+            if (!mkdir($dest, 0777, true) && !is_dir($dest)) {
+                throw new StorageException("无法创建备份数据库目录: {$dest}");
+            }
+            $this->copyDir($dir, $dest);
+            // 目标为已存在的空目录时先移除（Windows 下目录 rename 要求目标不存在）
+            if (is_dir($target) && !@rmdir($target)) {
+                throw new StorageException("无法腾空备份目标目录: {$target}");
+            }
+            if (!@rename($tmp, $target)) {
+                throw new StorageException("无法落盘备份目录: {$target}");
+            }
+        } catch (\Throwable $e) {
+            if (is_dir($tmp)) {
+                try {
+                    $this->removeDirRecursive($tmp);
+                } catch (StorageException) {
+                    // 清理失败可容忍（残留 .tmp-* 目录由使用者处置）
+                }
+            }
+            throw $e;
+        }
+    }
+
+    /**
+     * 校验备份目标：路径非空、不是文件、目录须为空，违规抛 StorageException
+     */
+    private function assertBackupTarget(string $targetDir): void
+    {
+        $target = rtrim($targetDir, '/\\');
+        if ($target === '') {
+            throw new StorageException('备份目标目录路径非法');
+        }
+        if (is_file($target)) {
+            throw new StorageException("备份目标已存在且不是目录: {$target}");
+        }
+        if (is_dir($target)) {
+            $entries = array_values(array_diff(scandir($target) ?: ['x'], ['.', '..']));
+            if ($entries !== []) {
+                throw new StorageException("备份目标目录须不存在或为空: {$target}");
+            }
+        }
+    }
+
+    /**
+     * 递归复制目录：排除锁文件与写盘中断残留的 .tmp.* 文件
+     */
+    private function copyDir(string $from, string $to): void
+    {
+        $entries = scandir($from);
+        if ($entries === false) {
+            throw new StorageException("无法读取目录: {$from}");
+        }
+        foreach ($entries as $entry) {
+            if ($entry === '.' || $entry === '..' || $entry === '.lock' || str_contains($entry, '.tmp.')) {
+                continue;
+            }
+            $src = $from . '/' . $entry;
+            $dst = $to . '/' . $entry;
+            if (is_dir($src)) {
+                if (!mkdir($dst, 0777, true) && !is_dir($dst)) {
+                    throw new StorageException("无法创建备份目录: {$dst}");
+                }
+                $this->copyDir($src, $dst);
+            } elseif (!@copy($src, $dst)) {
+                throw new StorageException("无法复制文件: {$src} -> {$dst}");
+            }
+        }
     }
 
     /**
@@ -395,12 +528,15 @@ abstract class FileEngine implements StorageEngine
                 throw new StorageException("无法创建数据库目录: {$dir}");
             }
 
-            // 删除缓存外的表文件
+            // 删除缓存外的表文件（视图定义文件跳过，由下方视图镜像写出）
             $files = scandir($dir);
             if ($files === false) {
                 throw new StorageException("无法读取数据库目录: {$dir}");
             }
             foreach ($files as $file) {
+                if ($file === self::VIEWS_FILENAME) {
+                    continue;
+                }
                 if (str_ends_with($file, $ext) && !isset($tables[substr($file, 0, -$extLen)])) {
                     $path = $dir . '/' . $file;
                     if (!@unlink($path)) {
@@ -411,6 +547,105 @@ abstract class FileEngine implements StorageEngine
 
             foreach ($tables as $table => $_entry) {
                 $this->writeTableFile($database, $table);
+            }
+
+            // 视图文件镜像缓存状态：未加载的库先从磁盘读入（防止空缓存覆盖既有视图）
+            if (!isset($this->viewCache[$database])) {
+                $this->viewCache[$database] = $this->readViewsFile($database);
+            }
+            $this->writeViewsFile($database);
+        }
+    }
+
+    /**
+     * 读取库的视图定义文件；文件缺失返回空数组，任何读取/解析失败抛 StorageException
+     *
+     * @return array<string, array<string, mixed>>
+     */
+    private function readViewsFile(string $database): array
+    {
+        $file = $this->dbDir($database) . '/' . self::VIEWS_FILENAME;
+        if (!is_file($file)) {
+            return [];
+        }
+        $raw = @file_get_contents($file);
+        if ($raw === false) {
+            throw new StorageException("无法读取视图定义文件: {$file}");
+        }
+        $raw = $this->codec->decode($raw);
+        $data = json_decode($raw, true);
+        if (!is_array($data)) {
+            throw new StorageException("视图定义文件不是合法 JSON: {$file}");
+        }
+        $definitions = [];
+        foreach ($data as $name => $definition) {
+            if (!is_string($name) || !is_array($definition)) {
+                throw new StorageException("视图定义文件结构非法: {$file}");
+            }
+            $definitions[$name] = $definition;
+        }
+
+        return $definitions;
+    }
+
+    /**
+     * 原子写出库的视图定义文件（先写临时文件再 rename，与表文件落盘一致）
+     */
+    private function writeViewsFile(string $database): void
+    {
+        $file = $this->dbDir($database) . '/' . self::VIEWS_FILENAME;
+        $dir = dirname($file);
+        if (!is_dir($dir) && !mkdir($dir, 0777, true) && !is_dir($dir)) {
+            throw new StorageException("无法创建数据库目录: {$dir}");
+        }
+
+        $payload = json_encode($this->viewCache[$database] ?? [], self::VIEWS_JSON_FLAGS);
+        if ($payload === false) {
+            throw new StorageException("视图定义无法编码为 JSON: {$database}");
+        }
+
+        $tmp = $file . '.tmp.' . uniqid('', true);
+        if (file_put_contents($tmp, $this->codec->encode($payload)) === false) {
+            throw new StorageException("无法写入临时文件: {$tmp}");
+        }
+        if (!@rename($tmp, $file)) {
+            @unlink($tmp);
+            throw new StorageException("无法落盘视图定义文件: {$file}");
+        }
+    }
+
+    /**
+     * 校验视图定义集合：视图名合法且定义为数组，违规抛 StorageException
+     *
+     * @param array<mixed> $definitions
+     */
+    private function assertViewDefinitions(array $definitions, string $database): void
+    {
+        foreach ($definitions as $name => $definition) {
+            if (!is_string($name) || preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $name) !== 1) {
+                throw new StorageException("非法视图名: {$database}." . (is_string($name) ? $name : get_debug_type($name)));
+            }
+            if (!is_array($definition)) {
+                throw new StorageException("视图定义必须为数组: {$database}.{$name}");
+            }
+        }
+    }
+
+    /**
+     * 校验还原后快照中的视图结构，非法抛 StorageException
+     *
+     * @param array<mixed> $views
+     */
+    private function validateViews(array $views): void
+    {
+        foreach ($views as $database => $definitions) {
+            if (!is_string($database) || !is_array($definitions)) {
+                throw new StorageException('快照数据结构非法');
+            }
+            foreach ($definitions as $name => $definition) {
+                if (!is_string($name) || !is_array($definition)) {
+                    throw new StorageException('快照数据结构非法');
+                }
             }
         }
     }
@@ -430,7 +665,7 @@ abstract class FileEngine implements StorageEngine
         $payload = $this->encode($entry['schema'], $entry['ai'], $entry['rows']);
 
         $tmp = $file . '.tmp.' . uniqid('', true);
-        if (file_put_contents($tmp, $payload) === false) {
+        if (file_put_contents($tmp, $this->codec->encode($payload)) === false) {
             throw new StorageException("无法写入临时文件: {$tmp}");
         }
         if (!@rename($tmp, $file)) {
@@ -450,6 +685,7 @@ abstract class FileEngine implements StorageEngine
         if ($raw === false) {
             throw new StorageException("无法读取表文件: {$file}");
         }
+        $raw = $this->codec->decode($raw);
 
         return $this->decode($raw, $file);
     }

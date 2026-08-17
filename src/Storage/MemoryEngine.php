@@ -17,6 +17,13 @@ final class MemoryEngine implements StorageEngine
      */
     private array $state = [];
 
+    /**
+     * 视图定义：库 => 视图名 => 定义数组
+     *
+     * @var array<string, array<string, array<string, mixed>>>
+     */
+    private array $views = [];
+
     public function databases(): array
     {
         return array_keys($this->state);
@@ -44,7 +51,7 @@ final class MemoryEngine implements StorageEngine
         if (!isset($this->state[$database])) {
             throw new StorageException("数据库不存在: {$database}");
         }
-        unset($this->state[$database]);
+        unset($this->state[$database], $this->views[$database]);
     }
 
     public function tables(string $database): array
@@ -189,24 +196,50 @@ final class MemoryEngine implements StorageEngine
         $this->state[$database][$table]['ai'] = 0;
     }
 
+    public function loadViewDefinitions(string $database): array
+    {
+        $this->assertValidName($database, '数据库');
+        $this->requireDatabase($database);
+
+        return $this->views[$database] ?? [];
+    }
+
+    public function saveViewDefinitions(string $database, array $definitions): void
+    {
+        $this->assertValidName($database, '数据库');
+        $this->requireDatabase($database);
+        $this->assertViewDefinitions($definitions, $database);
+        $this->views[$database] = $definitions;
+    }
+
     public function snapshot(): EngineSnapshot
     {
-        return new EngineSnapshot(serialize($this->state));
+        return new EngineSnapshot(serialize(['tables' => $this->state, 'views' => $this->views]));
     }
 
     public function restore(EngineSnapshot $snapshot): void
     {
-        $state = @unserialize($snapshot->payload);
-        if (!is_array($state)) {
+        $payload = @unserialize($snapshot->payload);
+        if (!is_array($payload)
+            || !isset($payload['tables'], $payload['views'])
+            || !is_array($payload['tables'])
+            || !is_array($payload['views'])) {
             throw new StorageException('快照数据无法反序列化');
         }
-        $this->validateState($state);
-        $this->state = $state;
+        $this->validateState($payload['tables']);
+        $this->validateViews($payload['views']);
+        $this->state = $payload['tables'];
+        $this->views = $payload['views'];
     }
 
     public function persist(): void
     {
         // 内存引擎无持久化需求
+    }
+
+    public function backupDatabase(string $database, string $targetDir): void
+    {
+        throw new StorageException('内存引擎不支持备份');
     }
 
     /**
@@ -227,6 +260,42 @@ final class MemoryEngine implements StorageEngine
                 throw new StorageException("删除序号重复: {$database}.{$table}#{$index}");
             }
             $seen[$index] = true;
+        }
+    }
+
+    /**
+     * 校验视图定义集合：视图名合法且定义为数组，违规抛 StorageException
+     *
+     * @param array<mixed> $definitions
+     */
+    private function assertViewDefinitions(array $definitions, string $database): void
+    {
+        foreach ($definitions as $name => $definition) {
+            if (!is_string($name) || preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $name) !== 1) {
+                throw new StorageException("非法视图名: {$database}." . (is_string($name) ? $name : get_debug_type($name)));
+            }
+            if (!is_array($definition)) {
+                throw new StorageException("视图定义必须为数组: {$database}.{$name}");
+            }
+        }
+    }
+
+    /**
+     * 校验还原后快照中的视图结构，非法抛 StorageException
+     *
+     * @param array<mixed> $views
+     */
+    private function validateViews(array $views): void
+    {
+        foreach ($views as $database => $definitions) {
+            if (!is_string($database) || !is_array($definitions)) {
+                throw new StorageException('快照数据结构非法');
+            }
+            foreach ($definitions as $name => $definition) {
+                if (!is_string($name) || !is_array($definition)) {
+                    throw new StorageException('快照数据结构非法');
+                }
+            }
         }
     }
 

@@ -31,6 +31,14 @@ final class PagedJsonEngine implements StorageEngine
 
     private const META_EXT = '.meta.json';
 
+    /**
+     * 视图定义文件名（库目录下）
+     *
+     * 注意：带前导点是有意为之——'.views' 非法表名，
+     * 不会被 tables() 的 .meta.json 扫描或 meta/页文件清理逻辑误认
+     */
+    private const VIEWS_FILENAME = '.views.json';
+
     /** 压实阈值：死槽绝对数下限（避免小表频繁全量重排） */
     private const COMPACT_MIN_DEAD = 100;
 
@@ -44,7 +52,14 @@ final class PagedJsonEngine implements StorageEngine
      */
     private array $cache = [];
 
-    public function __construct(private string $root, private int $pageSize = 512)
+    /**
+     * 视图定义：库 => 视图名 => 定义数组（写穿 + 懒加载）
+     *
+     * @var array<string, array<string, array<string, mixed>>>
+     */
+    private array $views = [];
+
+    public function __construct(private string $root, private int $pageSize = 512, private Codec $codec = new Codec())
     {
         if ($this->pageSize < 1) {
             throw new StorageException("页大小必须为正整数: {$this->pageSize}");
@@ -116,7 +131,7 @@ final class PagedJsonEngine implements StorageEngine
         if (is_dir($dir)) {
             $this->removeDirRecursive($dir);
         }
-        unset($this->cache[$database]);
+        unset($this->cache[$database], $this->views[$database]);
     }
 
     public function tables(string $database): array
@@ -502,9 +517,29 @@ final class PagedJsonEngine implements StorageEngine
         $this->writeMeta($database, $table, $entry);
     }
 
+    public function loadViewDefinitions(string $database): array
+    {
+        $this->assertValidName($database, '数据库');
+        $this->requireDatabase($database);
+        if (!isset($this->views[$database])) {
+            $this->views[$database] = $this->readViewsFile($database);
+        }
+
+        return $this->views[$database];
+    }
+
+    public function saveViewDefinitions(string $database, array $definitions): void
+    {
+        $this->assertValidName($database, '数据库');
+        $this->requireDatabase($database);
+        $this->assertViewDefinitions($definitions, $database);
+        $this->views[$database] = $definitions;
+        $this->writeViewsFile($database);
+    }
+
     public function snapshot(): EngineSnapshot
     {
-        // 先将磁盘上所有表加载进缓存，确保快照覆盖未加载的表
+        // 先将磁盘上所有表与视图加载进缓存，确保快照覆盖未加载的内容
         foreach ($this->databases() as $database) {
             if (!isset($this->cache[$database])) {
                 $this->cache[$database] = [];
@@ -512,18 +547,24 @@ final class PagedJsonEngine implements StorageEngine
             foreach ($this->tables($database) as $table) {
                 $this->loadTable($database, $table);
             }
+            $this->loadViewDefinitions($database);
         }
 
-        return new EngineSnapshot(serialize($this->cache));
+        return new EngineSnapshot(serialize(['tables' => $this->cache, 'views' => $this->views]));
     }
 
     public function restore(EngineSnapshot $snapshot): void
     {
-        $state = @unserialize($snapshot->payload);
-        if (!is_array($state)) {
+        $payload = @unserialize($snapshot->payload);
+        if (!is_array($payload)
+            || !isset($payload['tables'], $payload['views'])
+            || !is_array($payload['tables'])
+            || !is_array($payload['views'])) {
             throw new StorageException('快照数据无法反序列化');
         }
+        $state = $payload['tables'];
         $this->validateState($state);
+        $this->validateViews($payload['views']);
         // restore 后缓存即事实源，全部视为已加载
         foreach ($state as $database => $tables) {
             foreach ($tables as $table => $_entry) {
@@ -531,12 +572,103 @@ final class PagedJsonEngine implements StorageEngine
             }
         }
         $this->cache = $state;
+        $this->views = $payload['views'];
         $this->syncDisk();
     }
 
     public function persist(): void
     {
         $this->syncDisk();
+    }
+
+    public function backupDatabase(string $database, string $targetDir): void
+    {
+        $this->assertValidName($database, '数据库');
+        $this->requireDatabase($database);
+        $dir = $this->dbDir($database);
+        if (!is_dir($dir)) {
+            throw new StorageException("数据库不存在: {$database}");
+        }
+        $this->assertBackupTarget($targetDir);
+        // 引擎为写穿模型：任何变更（meta/页文件/视图）即时落盘，无需额外 flush，
+        // 直接拷贝库目录即为一致性快照（写盘中断残留的 .tmp.* 文件在拷贝时排除）
+
+        // 拷贝到临时目录后 rename：可见窗口内目标目录要么不存在要么为完整备份
+        // （rename 失败时可跨盘的场景不在本实现范围——临时目录与目标同级，必同盘）
+        $target = rtrim($targetDir, '/\\');
+        $tmp = $target . '.tmp-' . uniqid();
+        try {
+            if (!mkdir($tmp, 0777, true) && !is_dir($tmp)) {
+                throw new StorageException("无法创建备份临时目录: {$tmp}");
+            }
+            $dest = $tmp . '/' . $database;
+            if (!mkdir($dest, 0777, true) && !is_dir($dest)) {
+                throw new StorageException("无法创建备份数据库目录: {$dest}");
+            }
+            $this->copyDir($dir, $dest);
+            // 目标为已存在的空目录时先移除（Windows 下目录 rename 要求目标不存在）
+            if (is_dir($target) && !@rmdir($target)) {
+                throw new StorageException("无法腾空备份目标目录: {$target}");
+            }
+            if (!@rename($tmp, $target)) {
+                throw new StorageException("无法落盘备份目录: {$target}");
+            }
+        } catch (\Throwable $e) {
+            if (is_dir($tmp)) {
+                try {
+                    $this->removeDirRecursive($tmp);
+                } catch (StorageException) {
+                    // 清理失败可容忍（残留 .tmp-* 目录由使用者处置）
+                }
+            }
+            throw $e;
+        }
+    }
+
+    /**
+     * 校验备份目标：路径非空、不是文件、目录须为空，违规抛 StorageException
+     */
+    private function assertBackupTarget(string $targetDir): void
+    {
+        $target = rtrim($targetDir, '/\\');
+        if ($target === '') {
+            throw new StorageException('备份目标目录路径非法');
+        }
+        if (is_file($target)) {
+            throw new StorageException("备份目标已存在且不是目录: {$target}");
+        }
+        if (is_dir($target)) {
+            $entries = array_values(array_diff(scandir($target) ?: ['x'], ['.', '..']));
+            if ($entries !== []) {
+                throw new StorageException("备份目标目录须不存在或为空: {$target}");
+            }
+        }
+    }
+
+    /**
+     * 递归复制目录：排除锁文件与写盘中断残留的 .tmp.* 文件
+     */
+    private function copyDir(string $from, string $to): void
+    {
+        $entries = scandir($from);
+        if ($entries === false) {
+            throw new StorageException("无法读取目录: {$from}");
+        }
+        foreach ($entries as $entry) {
+            if ($entry === '.' || $entry === '..' || $entry === '.lock' || str_contains($entry, '.tmp.')) {
+                continue;
+            }
+            $src = $from . '/' . $entry;
+            $dst = $to . '/' . $entry;
+            if (is_dir($src)) {
+                if (!mkdir($dst, 0777, true) && !is_dir($dst)) {
+                    throw new StorageException("无法创建备份目录: {$dst}");
+                }
+                $this->copyDir($src, $dst);
+            } elseif (!@copy($src, $dst)) {
+                throw new StorageException("无法复制文件: {$src} -> {$dst}");
+            }
+        }
     }
 
     /**
@@ -596,6 +728,91 @@ final class PagedJsonEngine implements StorageEngine
 
             foreach ($tables as $table => $_entry) {
                 $this->rewriteTable($database, $table);
+            }
+
+            // 视图文件镜像缓存状态：未加载的库先从磁盘读入（防止空缓存覆盖既有视图）
+            if (!isset($this->views[$database])) {
+                $this->views[$database] = $this->readViewsFile($database);
+            }
+            $this->writeViewsFile($database);
+        }
+    }
+
+    /**
+     * 读取库的视图定义文件；文件缺失返回空数组，任何读取/解析失败抛 StorageException
+     *
+     * @return array<string, array<string, mixed>>
+     */
+    private function readViewsFile(string $database): array
+    {
+        $file = $this->dbDir($database) . '/' . self::VIEWS_FILENAME;
+        if (!is_file($file)) {
+            return [];
+        }
+        $raw = @file_get_contents($file);
+        if ($raw === false) {
+            throw new StorageException("无法读取视图定义文件: {$file}");
+        }
+        $raw = $this->codec->decode($raw);
+        $data = json_decode($raw, true);
+        if (!is_array($data)) {
+            throw new StorageException("视图定义文件不是合法 JSON: {$file}");
+        }
+        $definitions = [];
+        foreach ($data as $name => $definition) {
+            if (!is_string($name) || !is_array($definition)) {
+                throw new StorageException("视图定义文件结构非法: {$file}");
+            }
+            $definitions[$name] = $definition;
+        }
+
+        return $definitions;
+    }
+
+    /**
+     * 原子写出库的视图定义文件（复用既有 atomicWrite）
+     */
+    private function writeViewsFile(string $database): void
+    {
+        $payload = json_encode($this->views[$database] ?? [], self::JSON_FLAGS);
+        if ($payload === false) {
+            throw new StorageException("视图定义无法编码为 JSON: {$database}");
+        }
+        $this->atomicWrite($this->dbDir($database) . '/' . self::VIEWS_FILENAME, $payload);
+    }
+
+    /**
+     * 校验视图定义集合：视图名合法且定义为数组，违规抛 StorageException
+     *
+     * @param array<mixed> $definitions
+     */
+    private function assertViewDefinitions(array $definitions, string $database): void
+    {
+        foreach ($definitions as $name => $definition) {
+            if (!is_string($name) || preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $name) !== 1) {
+                throw new StorageException("非法视图名: {$database}." . (is_string($name) ? $name : get_debug_type($name)));
+            }
+            if (!is_array($definition)) {
+                throw new StorageException("视图定义必须为数组: {$database}.{$name}");
+            }
+        }
+    }
+
+    /**
+     * 校验还原后快照中的视图结构，非法抛 StorageException
+     *
+     * @param array<mixed> $views
+     */
+    private function validateViews(array $views): void
+    {
+        foreach ($views as $database => $definitions) {
+            if (!is_string($database) || !is_array($definitions)) {
+                throw new StorageException('快照数据结构非法');
+            }
+            foreach ($definitions as $name => $definition) {
+                if (!is_string($name) || !is_array($definition)) {
+                    throw new StorageException('快照数据结构非法');
+                }
             }
         }
     }
@@ -667,7 +884,7 @@ final class PagedJsonEngine implements StorageEngine
             throw new StorageException("无法创建数据库目录: {$dir}");
         }
         $tmp = $file . '.tmp.' . uniqid('', true);
-        if (file_put_contents($tmp, $payload) === false) {
+        if (file_put_contents($tmp, $this->codec->encode($payload)) === false) {
             throw new StorageException("无法写入临时文件: {$tmp}");
         }
         if (!@rename($tmp, $file)) {
@@ -690,6 +907,7 @@ final class PagedJsonEngine implements StorageEngine
         if ($raw === false) {
             throw new StorageException("无法读取表 meta 文件: {$file}");
         }
+        $raw = $this->codec->decode($raw);
         $data = json_decode($raw, true);
         if (!is_array($data)) {
             throw new StorageException("表 meta 文件不是合法 JSON: {$file}");
@@ -738,6 +956,7 @@ final class PagedJsonEngine implements StorageEngine
         if ($raw === false) {
             throw new StorageException("页文件缺失: {$file}");
         }
+        $raw = $this->codec->decode($raw);
         $data = json_decode($raw, true);
         if (!is_array($data) || !array_key_exists('rows', $data) || !is_array($data['rows'])) {
             throw new StorageException("页文件结构非法: {$file}");

@@ -192,10 +192,12 @@ final class JsonFileEngineTest extends StorageEngineContractTestCase
 
         $state = unserialize($snapshot->payload);
         $this->assertIsArray($state);
-        $this->assertArrayHasKey('db', $state);
-        $this->assertArrayHasKey('t', $state['db']);
-        $this->assertSame([['id' => 1, 'name' => 'a']], $state['db']['t']['rows']);
-        $this->assertSame(1, $state['db']['t']['ai']);
+        // v2.0 起快照载荷为 ['tables' => ..., 'views' => ...]（视图定义纳入事务快照）
+        $this->assertArrayHasKey('tables', $state);
+        $this->assertArrayHasKey('db', $state['tables']);
+        $this->assertArrayHasKey('t', $state['tables']['db']);
+        $this->assertSame([['id' => 1, 'name' => 'a']], $state['tables']['db']['t']['rows']);
+        $this->assertSame(1, $state['tables']['db']['t']['ai']);
     }
 
     /**

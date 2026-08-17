@@ -8,7 +8,11 @@ use Kingbes\Psql\Exception\QueryException;
 use Kingbes\Psql\Exception\SchemaException;
 use Kingbes\Psql\Exception\TransactionException;
 use Kingbes\Psql\Execution\IndexManager;
+use Kingbes\Psql\Execution\Trigger;
+use Kingbes\Psql\Execution\TriggerManager;
+use Kingbes\Psql\Query\SelectBuilder;
 use Kingbes\Psql\Query\Table;
+use Kingbes\Psql\Query\ViewDefinition;
 use Kingbes\Psql\Schema\AlterBlueprint;
 use Kingbes\Psql\Schema\Blueprint;
 use Kingbes\Psql\Schema\ColumnSchema;
@@ -30,10 +34,18 @@ final class Connection
 
     private ?EngineSnapshot $transactionSnapshot = null;
 
+    /** 事务内保存点栈（栈序即建立序；元素含名字与建立时的引擎快照）
+     *
+     * @var list<array{name: string, snapshot: EngineSnapshot}>
+     */
+    private array $savepoints = [];
+
     /** 数据版本号：任何数据/结构变更后自增（索引缓存失效依据） */
     private int $writeVersion = 0;
 
     private ?IndexManager $indexManager = null;
+
+    private ?TriggerManager $triggerManager = null;
 
     public function __construct(private StorageEngine $engine, string $database = 'main')
     {
@@ -98,6 +110,23 @@ final class Connection
             throw new SchemaException("数据库不存在: {$name}");
         }
         $this->database = $name;
+    }
+
+    // ---- 备份 ----
+
+    /**
+     * 全库备份：当前库的完整一致性快照导出到目标目录（文件引擎：复制库目录全部文件）
+     *
+     * 目标目录须不存在或为空目录，否则抛 StorageException；
+     * 活动事务中调用抛 TransactionException；内存引擎抛 StorageException
+     * 备份目录即合法库目录：可用 Psql::connect(备份目录) 直接打开（加密库的备份同为密文，需原 key）
+     */
+    public function backup(string $targetDir): void
+    {
+        if ($this->transactionSnapshot !== null) {
+            throw new TransactionException('事务中无法备份');
+        }
+        $this->engine->backupDatabase($this->database, $targetDir);
     }
 
     // ---- 表操作 ----
@@ -357,6 +386,77 @@ final class Connection
         return false;
     }
 
+    // ---- 视图操作 ----
+
+    /**
+     * 创建视图：把一个 SelectBuilder 的查询固化为命名视图（与表/其他视图同库命名空间互斥）
+     *
+     * 名称规则同表名；与表名/其他视图名冲突抛 SchemaException；
+     * 查询包含不可持久化部分（子查询条件/投影表达式）抛 QueryException
+     */
+    public function createView(string $name, SelectBuilder $query): void
+    {
+        $this->assertValidViewName($name);
+        if ($this->engine->hasTable($this->database, $name)) {
+            throw new SchemaException("名称已被表占用: {$this->database}.{$name}");
+        }
+        $definitions = $this->engine->loadViewDefinitions($this->database);
+        if (isset($definitions[$name])) {
+            throw new SchemaException("视图已存在: {$this->database}.{$name}");
+        }
+
+        // 立即序列化校验可持久化性（子查询条件等在此时转抛 QueryException，消息清晰）
+        $definitions[$name] = ViewDefinition::fromQuery($name, $query->toQuery())->toArray();
+        $this->engine->saveViewDefinitions($this->database, $definitions);
+        $this->recordWrite();
+    }
+
+    /**
+     * 删除视图；不存在抛 SchemaException
+     */
+    public function dropView(string $name): void
+    {
+        $definitions = $this->engine->loadViewDefinitions($this->database);
+        if (!isset($definitions[$name])) {
+            throw new SchemaException("视图不存在: {$this->database}.{$name}");
+        }
+        unset($definitions[$name]);
+        $this->engine->saveViewDefinitions($this->database, $definitions);
+        $this->recordWrite();
+    }
+
+    public function hasView(string $name): bool
+    {
+        return isset($this->engine->loadViewDefinitions($this->database)[$name]);
+    }
+
+    /**
+     * 当前库全部视图名（字典序）
+     *
+     * @return list<string>
+     */
+    public function views(): array
+    {
+        $names = array_keys($this->engine->loadViewDefinitions($this->database));
+        sort($names, SORT_STRING);
+
+        return $names;
+    }
+
+    /**
+     * 取视图的可继续链式副本（where/orderBy/get 等）；
+     * 每次调用从存储定义重建，后续链式操作不影响存储定义；不存在抛 SchemaException
+     */
+    public function view(string $name): SelectBuilder
+    {
+        $definitions = $this->engine->loadViewDefinitions($this->database);
+        if (!isset($definitions[$name])) {
+            throw new SchemaException("视图不存在: {$this->database}.{$name}");
+        }
+
+        return SelectBuilder::fromDefinition($this, ViewDefinition::fromArray($definitions[$name]));
+    }
+
     // ---- DML 入口 ----
 
     /**
@@ -390,7 +490,7 @@ final class Connection
     }
 
     /**
-     * 提交事务：持久化引擎状态并清空快照；不在事务中抛 TransactionException
+     * 提交事务：持久化引擎状态并清空快照与保存点栈；不在事务中抛 TransactionException
      */
     public function commit(): void
     {
@@ -399,10 +499,11 @@ final class Connection
         }
         $this->engine->persist();
         $this->transactionSnapshot = null;
+        $this->savepoints = [];
     }
 
     /**
-     * 回滚事务：恢复引擎到快照状态并清空快照；不在事务中抛 TransactionException
+     * 回滚事务：恢复引擎到快照状态并清空快照与保存点栈；不在事务中抛 TransactionException
      */
     public function rollBack(): void
     {
@@ -411,6 +512,7 @@ final class Connection
         }
         $this->engine->restore($this->transactionSnapshot);
         $this->transactionSnapshot = null;
+        $this->savepoints = [];
         // restore 改写了引擎数据，必须失效索引缓存（最关键的失效点）
         $this->recordWrite();
     }
@@ -421,6 +523,71 @@ final class Connection
     public function inTransaction(): bool
     {
         return $this->transactionSnapshot !== null;
+    }
+
+    // ---- 保存点 ----
+
+    /**
+     * 在当前事务内建立命名保存点（快照引擎全量状态压栈）；
+     * 事务外调用或名字为空抛 TransactionException；
+     * 同名重复 savepoint 覆盖旧条目（后压优先，回滚回到最近一次同名保存点）
+     */
+    public function savepoint(string $name): void
+    {
+        if ($this->transactionSnapshot === null) {
+            throw new TransactionException('不在事务中，无法建立保存点');
+        }
+        if ($name === '') {
+            throw new TransactionException('保存点名称不能为空');
+        }
+        $this->savepoints = array_values(array_filter(
+            $this->savepoints,
+            static fn (array $savepoint): bool => $savepoint['name'] !== $name,
+        ));
+        $this->savepoints[] = ['name' => $name, 'snapshot' => $this->engine->snapshot()];
+    }
+
+    /**
+     * 回滚到保存点：恢复建立该保存点时的引擎状态，弹出其之后压入的全部更内层保存点，
+     * 保存点自身保留（可再次回滚，复用同一快照对象）；
+     * 事务外调用或保存点不存在（含已被外层回滚/释放波及）抛 TransactionException
+     */
+    public function rollBackTo(string $name): void
+    {
+        $position = $this->findSavepoint($name, '回滚到');
+        $this->engine->restore($this->savepoints[$position]['snapshot']);
+        // 外层回滚丢弃内层：保留该保存点自身及其外层条目
+        $this->savepoints = array_slice($this->savepoints, 0, $position + 1);
+        // restore 改写了引擎数据，必须失效索引缓存（与 rollBack 同一纪律）
+        $this->recordWrite();
+    }
+
+    /**
+     * 释放保存点：弹出该保存点及其之后压入的全部更内层保存点（SQL 标准：释放外层时内层一并失效）；
+     * 不改变数据；事务外调用或保存点不存在抛 TransactionException
+     */
+    public function releaseSavepoint(string $name): void
+    {
+        $position = $this->findSavepoint($name, '释放');
+        $this->savepoints = array_slice($this->savepoints, 0, $position);
+    }
+
+    /**
+     * 在保存点栈内查找名字并返回栈内位置（保存点建立时同名旧条目已被移除，名字唯一）；
+     * 不存在抛 TransactionException（消息含动作词以区分回滚/释放场景）
+     */
+    private function findSavepoint(string $name, string $action): int
+    {
+        if ($this->transactionSnapshot === null) {
+            throw new TransactionException("不在事务中，无法{$action}保存点");
+        }
+        foreach ($this->savepoints as $position => $savepoint) {
+            if ($savepoint['name'] === $name) {
+                return $position;
+            }
+        }
+
+        throw new TransactionException("保存点不存在或已失效，无法{$action}: {$name}");
     }
 
     // ---- 写版本与索引管理 ----
@@ -451,6 +618,50 @@ final class Connection
         return $this->indexManager ??= new IndexManager($this);
     }
 
+    // ---- 触发器 ----
+
+    /**
+     * 注册触发器并返回句柄（可用于 dropTrigger 移除）；
+     * $timing: 'before'|'after'（大小写不敏感）；$event: 'insert'|'update'|'delete'（大小写不敏感）；
+     * 表不存在或 timing/event 非法抛 QueryException
+     *
+     * 触发器为连接级运行时注册（handler 为 PHP 可调用，不可持久化，重建连接后需重新注册）
+     */
+    public function createTrigger(string $table, string $timing, string $event, callable $handler): Trigger
+    {
+        $timing = strtolower($timing);
+        $event = strtolower($event);
+        if (!in_array($timing, ['before', 'after'], true)) {
+            throw new QueryException("非法触发器时机: {$timing}（仅支持 before/after）");
+        }
+        if (!in_array($event, ['insert', 'update', 'delete'], true)) {
+            throw new QueryException("非法触发器事件: {$event}（仅支持 insert/update/delete）");
+        }
+        if (!$this->engine->hasTable($this->database, $table)) {
+            throw new QueryException("表不存在: {$this->database}.{$table}");
+        }
+
+        return $this->triggerManager()->register($table, $timing, $event, $handler);
+    }
+
+    /**
+     * 移除触发器；句柄未注册或已移除抛 QueryException
+     */
+    public function dropTrigger(Trigger $trigger): void
+    {
+        $this->triggerManager()->remove($trigger);
+    }
+
+    /**
+     * 连接级触发器管理器单例（懒创建）
+     *
+     * @internal
+     */
+    public function triggerManager(): TriggerManager
+    {
+        return $this->triggerManager ??= new TriggerManager();
+    }
+
     // ---- 内部 ----
 
     /**
@@ -464,6 +675,16 @@ final class Connection
         $definition($blueprint);
 
         return $blueprint->toSchema($name);
+    }
+
+    /**
+     * 视图名必须匹配 ^[A-Za-z_][A-Za-z0-9_]*$（与表名规则一致）
+     */
+    private function assertValidViewName(string $name): void
+    {
+        if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $name) !== 1) {
+            throw new SchemaException("非法视图名: {$name}");
+        }
     }
 
     /**

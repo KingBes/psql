@@ -43,6 +43,7 @@ final class Writer
             return new InsertResult(0, null);
         }
 
+        $triggers = $this->connection->triggerManager();
         $existing = $engine->readRows($db, $table);
         $aiColumn = $schema->autoIncrementColumn();
         $aiName = $aiColumn?->name;
@@ -64,6 +65,9 @@ final class Writer
         $nextAi = $currentAi;
         $maxUsedAi = $currentAi;
         foreach ($rows as $row) {
+            // BEFORE INSERT：类型转换/约束校验之前（用户触发器看到原始输入行，可补默认值/清洗，
+            // 返回行进入既有 cast 管线；抛异常则本次 insert 整体失败，批内天然原子——尚未落盘）
+            $row = $triggers->beforeInsert($table, $row);
             $newRow = $this->buildInsertRow($schema, $table, $row);
 
             // 自增分配：显式提供合法；缺省/null 从当前已分配值 +1 起跳过冲突候选
@@ -104,6 +108,13 @@ final class Writer
             $engine->setAutoIncrement($db, $table, $maxUsedAi);
         }
         $this->connection->recordWrite();
+
+        // AFTER INSERT：成功落盘 + recordWrite 之后（行含最终形态：自增 id 已分配、默认值已填）
+        if ($triggers->has($table, 'after', 'insert')) {
+            foreach ($accepted as $newRow) {
+                $triggers->afterInsert($table, $newRow);
+            }
+        }
 
         $lastRow = $accepted[count($accepted) - 1];
 
@@ -188,6 +199,15 @@ final class Writer
         int $hitIndex,
         array $existing,
     ): int {
+        $triggers = $this->connection->triggerManager();
+        $oldRow = $existing[$hitIndex];
+
+        // BEFORE UPDATE：new = old 行 + cast 前的用户值合并整行；返回整行替换用户值进入既有 cast/约束管线
+        // （返回行中未被 update 的列以 old 值为底；无触发器时保持仅处理用户提供列的既有路径）
+        if ($triggers->has($table, 'before', 'update')) {
+            $row = $triggers->beforeUpdate($table, $oldRow, array_merge($oldRow, $row));
+        }
+
         // 逐列 cast 并校验 NOT NULL（主键列隐含 NOT NULL）
         $casted = [];
         foreach ($schema->columns as $column) {
@@ -211,6 +231,11 @@ final class Writer
         $existing[$hitIndex] = $newRow;
         $this->connection->engine()->writeRows($db, $table, $existing);
         $this->connection->recordWrite();
+
+        // AFTER UPDATE：该行成功更新后（old 原行，new 落盘新行）
+        if ($triggers->has($table, 'after', 'update')) {
+            $triggers->afterUpdate($table, $oldRow, $newRow);
+        }
 
         return 2;
     }
@@ -252,16 +277,84 @@ final class Writer
         return array_keys($hit);
     }
 
+    // ---- REPLACE ----
+
+    /**
+     * REPLACE INTO（MySQL 语义）：无唯一冲突直接插入返回 1；
+     * 唯一冲突（主键/unique/复合元组，含部分 null 组不触发——沿用 findUniqueConflictRows 语义）
+     * 时先删全部命中旧行再插入新行，返回删除 + 插入合计（一次冲突 replace 删 1 插 1 计 2）
+     *
+     * 约束校验（cast/默认回填/NOT NULL/CHECK/FK 存在性）先于删除执行——新行非法时旧行保留；
+     * 冲突行删除走完整 delete 管线（BEFORE/AFTER DELETE 触发器与外键 RESTRICT/CASCADE 照常——
+     * REPLACE 被 RESTRICT 拦截是 MySQL 同款语义）；插入走完整 insert 管线（BEFORE/AFTER INSERT 照常）；
+     * 边界：删除后插入阶段再抛异常（校验已过，理论上仅 BEFORE INSERT 触发器改值等场景可能）
+     * 时异常上抛且旧行已删；
+     * 自增列：新行带显式 PK=旧 PK 时替换保留该 PK；未带 PK 时 PK 组跳过检测，仅其他唯一组冲突才触发替换
+     *
+     * @param array<string,mixed> $row
+     */
+    public function replace(string $table, ?string $alias, array $row): int
+    {
+        $db = $this->connection->currentDatabase();
+        $engine = $this->connection->engine();
+        $schema = $engine->loadSchema($db, $table);
+
+        // 校验先行：cast/默认回填/NOT NULL + CHECK + FK 存在性（任一失败抛异常，旧行不删）
+        $candidate = $this->buildInsertRow($schema, $table, $row);
+        $this->assertChecks($table, $schema, $candidate);
+        $this->assertForeignKeys($db, $table, $schema, $candidate);
+
+        // 唯一冲突扫描（candidate 中未提供值的唯一组含 null，整体跳过——MySQL UNIQUE 允许多个 NULL）
+        $existing = $engine->readRows($db, $table);
+        $hitIndexes = $this->findUniqueConflictRows($schema, $candidate, $existing);
+        if ($hitIndexes === []) {
+            $this->insert($table, $alias, [$row]);
+
+            return 1;
+        }
+
+        // 先删（delete 管线：触发器/级联/RESTRICT）再插（insert 管线：AI 分配/触发器）
+        $deleted = $this->deleteMatched($db, $table, $schema, $existing, $hitIndexes);
+        $this->insert($table, $alias, [$row]);
+
+        return $deleted + 1;
+    }
+
+    /**
+     * 批量 REPLACE：逐行独立处理（非批内原子，MySQL 语义——某行失败时此前行已生效），
+     * 返回各行删除 + 插入受影响数合计
+     *
+     * @param list<array<string,mixed>> $rows
+     */
+    public function replaceMany(string $table, ?string $alias, array $rows): int
+    {
+        $affected = 0;
+        foreach ($rows as $row) {
+            $affected += $this->replace($table, $alias, $row);
+        }
+
+        return $affected;
+    }
+
     // ---- UPDATE ----
 
     /**
      * 按条件更新，返回受影响（matched）行数；
-     * 被引用列变化时按引用方外键的 onUpdate 策略分发（RESTRICT/CASCADE/SET_NULL/SET_DEFAULT）
+     * 被引用列变化时按引用方外键的 onUpdate 策略分发（RESTRICT/CASCADE/SET_NULL/SET_DEFAULT）；
+     * 携带 orderBy/limit 时为 MySQL UPDATE ... ORDER BY ... LIMIT 语义（matched 排序后取前 limit 行更新，
+     * 无排序规格则按存储序截取；limit 0 合法返回 0）
      *
      * @param array<string,mixed> $values
+     * @param list<array{column: string, direction: 'ASC'|'DESC'}>|null $orderBy
      */
-    public function update(string $table, ?string $alias, ?Condition $where, array $values): int
-    {
+    public function update(
+        string $table,
+        ?string $alias,
+        ?Condition $where,
+        array $values,
+        ?array $orderBy = null,
+        ?int $limit = null,
+    ): int {
         $db = $this->connection->currentDatabase();
         $engine = $this->connection->engine();
         $schema = $engine->loadSchema($db, $table);
@@ -295,10 +388,40 @@ final class Writer
             }
         }
 
+        // ORDER BY + LIMIT（MySQL UPDATE ... ORDER BY ... LIMIT 语义）：排序后仅保留前 limit 行
+        if ($orderBy !== null || $limit !== null) {
+            $matched = $this->orderLimitMatched($schema, $table, $rows, $matched, $orderBy ?? [], $limit);
+        }
+
         // matched 行的新行
+        $triggers = $this->connection->triggerManager();
+        $hasBeforeUpdate = $triggers->has($table, 'before', 'update');
         $newRows = [];
         foreach ($matched as $index) {
-            $newRows[$index] = array_merge($rows[$index], $casted);
+            if (!$hasBeforeUpdate) {
+                $newRows[$index] = array_merge($rows[$index], $casted);
+                continue;
+            }
+            // BEFORE UPDATE：new = old 行 + cast 前的用户值合并整行；触发器返回整行为最终新行，
+            // 逐列 cast + NOT NULL 校验后进入既有约束管线（未被 update 的列以 old 值为底重新 cast，幂等）
+            $newRow = $triggers->beforeUpdate(
+                $table,
+                $rows[$index],
+                array_merge($rows[$index], $values),
+            );
+            foreach ($newRow as $key => $value) {
+                if (!$schema->hasColumn((string) $key)) {
+                    throw new QueryException("未知列: {$table}.{$key}");
+                }
+            }
+            foreach ($schema->columns as $column) {
+                $castValue = ValueCaster::cast($newRow[$column->name] ?? null, $column);
+                if (($column->notNull || $column->primaryKey) && $castValue === null) {
+                    throw new ConstraintException("表 {$table} 列 {$column->name} 不允许为 NULL");
+                }
+                $newRow[$column->name] = $castValue;
+            }
+            $newRows[$index] = $newRow;
         }
 
         // 引用本表且指向本次更新列的外键；被引用列值实际变化时需按 onUpdate 策略处理
@@ -328,11 +451,19 @@ final class Writer
 
         // 简单路径：无被引用列变化，直接写回
         if (!$referencedChanged) {
+            $oldRows = $rows;
             foreach ($newRows as $index => $newRow) {
                 $rows[$index] = $newRow;
             }
             $engine->writeRows($db, $table, $rows);
             $this->connection->recordWrite();
+
+            // AFTER UPDATE：成功落盘后逐行（old 原行，new 落盘新行）
+            if ($triggers->has($table, 'after', 'update')) {
+                foreach ($matched as $index) {
+                    $triggers->afterUpdate($table, $oldRows[$index], $newRows[$index]);
+                }
+            }
 
             return count($matched);
         }
@@ -449,6 +580,13 @@ final class Writer
         }
         $this->connection->recordWrite();
 
+        // AFTER UPDATE：成功落盘后逐行（old 原行，new 传播后的最终形态行）
+        if ($triggers->has($table, 'after', 'update')) {
+            foreach ($matched as $index) {
+                $triggers->afterUpdate($table, $rows[$index], $allRows[$table][$index]);
+            }
+        }
+
         return count($matched);
     }
 
@@ -456,9 +594,13 @@ final class Writer
 
     /**
      * 按条件删除（BFS 级联），返回初始 matched 行数（级联删除不计入）；
-     * 引用方外键按 onDelete 策略分发：RESTRICT 拦截 / CASCADE 级联 / SET_NULL 置空 / SET_DEFAULT 置默认
+     * 引用方外键按 onDelete 策略分发：RESTRICT 拦截 / CASCADE 级联 / SET_NULL 置空 / SET_DEFAULT 置默认；
+     * 携带 orderBy/limit 时为 MySQL DELETE ... ORDER BY ... LIMIT 语义（matched 排序后取前 limit 行删除，
+     * 无排序规格则按存储序截取；limit 0 合法返回 0）
+     *
+     * @param list<array{column: string, direction: 'ASC'|'DESC'}>|null $orderBy
      */
-    public function delete(string $table, ?string $alias, ?Condition $where): int
+    public function delete(string $table, ?string $alias, ?Condition $where, ?array $orderBy = null, ?int $limit = null): int
     {
         $db = $this->connection->currentDatabase();
         $engine = $this->connection->engine();
@@ -474,8 +616,36 @@ final class Writer
                 $matched[] = $index;
             }
         }
+
+        // ORDER BY + LIMIT（MySQL DELETE ... ORDER BY ... LIMIT 语义）：排序后仅保留前 limit 行
+        if ($orderBy !== null || $limit !== null) {
+            $matched = $this->orderLimitMatched($schema, $table, $rows, $matched, $orderBy ?? [], $limit);
+        }
+
         if ($matched === []) {
             return 0;
+        }
+
+        return $this->deleteMatched($db, $table, $schema, $rows, $matched);
+    }
+
+    /**
+     * 按行号删除核心管线（delete 入口与 REPLACE 复用）：BEFORE/AFTER DELETE 触发器、
+     * BFS 级联（CASCADE/SET_NULL/SET_DEFAULT）、RESTRICT 拦截、SET_DEFAULT 存在性复检
+     *
+     * @param list<array<string,mixed>> $rows 基表行快照（行号与 $matched 对应）
+     * @param list<int> $matched 待删除行号
+     */
+    private function deleteMatched(string $db, string $table, TableSchema $schema, array $rows, array $matched): int
+    {
+        $engine = $this->connection->engine();
+        $triggers = $this->connection->triggerManager();
+
+        // BEFORE DELETE：初始 matched 行逐行触发（抛异常则整批失败——尚未落盘天然原子）
+        if ($triggers->has($table, 'before', 'delete')) {
+            foreach ($matched as $index) {
+                $triggers->beforeDelete($table, $rows[$index]);
+            }
         }
 
         // 全库结构/行缓存（BFS 需要跨表扫描）
@@ -522,6 +692,13 @@ final class Writer
                         if ($action === ForeignKeyAction::CASCADE) {
                             if (!$already) {
                                 $deleteSet[$refTableName][$refIndex] = true;
+                                // 级联删除的子表行同样触发其表的 BEFORE DELETE（BFS 各层逐行）
+                                if ($triggers->has($refTableName, 'before', 'delete')) {
+                                    $triggers->beforeDelete(
+                                        $refTableName,
+                                        $allRows[$refTableName][$refIndex],
+                                    );
+                                }
                                 $queue[] = [$refTableName, $refIndex];
                             }
                             continue;
@@ -607,6 +784,17 @@ final class Writer
         }
         // deleteRows 与 writeRows 两种落盘路径统一在此记录写版本（索引缓存失效）
         $this->connection->recordWrite();
+
+        // AFTER DELETE：全部落盘后各表逐行触发（被级联波及的行同样触发其表；SET_NULL/SET_DEFAULT
+        // 引用方行不属于 DELETE 事件不触发；行取删除前内存副本）
+        foreach ($deleteSet as $name => $indexes) {
+            if (!$triggers->has($name, 'after', 'delete')) {
+                continue;
+            }
+            foreach (array_keys($indexes) as $index) {
+                $triggers->afterDelete($name, $allRows[$name][$index]);
+            }
+        }
 
         return count($matched);
     }
@@ -863,6 +1051,101 @@ final class Writer
         }
 
         return $map;
+    }
+
+    /**
+     * UPDATE/DELETE 的 ORDER BY + LIMIT 语义：matched 行号按排序规格稳定排序后截取前 limit 个；
+     * 排序语义与 Executor 一致——null 视为最小、双侧数值性按数值、CI 列字符串折叠后比较、
+     * 排序键全相等保持存储序（稳定）；无排序规格时按存储序（无序）截取（MySQL 允许）
+     *
+     * @param list<array<string,mixed>> $rows 基表行（行号与 $matched 对应）
+     * @param list<int> $matched
+     * @param list<array{column: string, direction: 'ASC'|'DESC'}> $orderBy
+     * @return list<int>
+     */
+    private function orderLimitMatched(
+        TableSchema $schema,
+        string $table,
+        array $rows,
+        array $matched,
+        array $orderBy,
+        ?int $limit,
+    ): array {
+        if ($limit !== null && $limit < 0) {
+            throw new QueryException("limit 不允许为负数: {$limit}");
+        }
+
+        // 排序规格解析：限定名剥前缀取裸列名，未知列抛 QueryException；CI 解析复用 where 同款规则
+        $collations = self::collationsOf($schema);
+        $specs = [];
+        foreach ($orderBy as $order) {
+            $name = $order['column'];
+            $pos = strrpos($name, '.');
+            if ($pos !== false) {
+                $name = substr($name, $pos + 1);
+            }
+            if (!$schema->hasColumn($name)) {
+                throw new QueryException("未知列: {$table}.{$order['column']}");
+            }
+            $specs[] = [
+                'column' => $name,
+                'direction' => $order['direction'],
+                'ci' => ConditionEvaluator::resolveCI($collations, $order['column']),
+            ];
+        }
+
+        if ($specs !== []) {
+            // 稳定排序：usort 前标记原序号，排序键全相等时保持存储序
+            $decorated = [];
+            foreach ($matched as $position => $index) {
+                $decorated[] = ['position' => $position, 'index' => $index];
+            }
+            usort($decorated, function (array $a, array $b) use ($rows, $specs): int {
+                foreach ($specs as $spec) {
+                    $cmp = $this->compareForSort(
+                        $rows[$a['index']][$spec['column']] ?? null,
+                        $rows[$b['index']][$spec['column']] ?? null,
+                        $spec['ci'],
+                    );
+                    if ($cmp !== 0) {
+                        return $spec['direction'] === 'DESC' ? -$cmp : $cmp;
+                    }
+                }
+
+                return $a['position'] <=> $b['position'];
+            });
+            $matched = array_map(static fn (array $item): int => $item['index'], $decorated);
+        }
+
+        if ($limit !== null) {
+            $matched = array_slice($matched, 0, $limit);
+        }
+
+        return $matched;
+    }
+
+    /**
+     * 排序比较（复用 ConditionEvaluator 比较语义）：null 视为最小；双侧数值性按数值；否则按字符串（ci 折叠）
+     */
+    private function compareForSort(mixed $left, mixed $right, bool $ci): int
+    {
+        if ($left === null && $right === null) {
+            return 0;
+        }
+        if ($left === null) {
+            return -1;
+        }
+        if ($right === null) {
+            return 1;
+        }
+        if (ConditionEvaluator::compareValues($left, '<', $right, $ci)) {
+            return -1;
+        }
+        if (ConditionEvaluator::compareValues($left, '>', $right, $ci)) {
+            return 1;
+        }
+
+        return 0;
     }
 
     /**
