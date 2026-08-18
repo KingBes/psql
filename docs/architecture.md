@@ -19,19 +19,23 @@
 | 目录 | 职责 |
 |---|---|
 | `src/Exception/` | 异常体系：`PsqlException`（抽象基类）+ 六个具体异常 |
-| `src/Schema/` | `Blueprint` 建表 DSL、`ColumnSchema`/`TableSchema`（readonly 不可变结构）、`ForeignKey`、`AlterBlueprint` |
-| `src/Type/` | `ValueCaster`：PHP 值 → 列类型的校验与规范化 |
-| `src/Query/` | `Table` 表访问入口、`SelectBuilder` 链式构建器、`Condition/` 条件模型、`ConditionEvaluator` 条件求值、`Agg` 聚合工厂、`Func`/`CaseWhen`/`ColumnRef` 投影表达式、`ViewDefinition`（视图定义 DTO 与结构化序列化）、`Explain`（静态计划分析）、`SelectQuery` 等 DTO |
-| `src/Execution/` | `Writer`（INSERT/UPDATE/DELETE 约束管线）、`Executor`（SELECT 流水线）、`IndexManager`（哈希索引缓存与预过滤）、`SubqueryResolver`（子查询解析）、`TriggerManager`/`Trigger`（触发器分发与句柄） |
+| `src/Schema/` | `Blueprint` 建表 DSL、`ColumnSchema`/`TableSchema`（readonly 不可变结构）、`ForeignKey`、`AlterBlueprint`、`Migration`（schema diff 迁移工具） |
+| `src/Type/` | `ValueCaster`：PHP 值 → 列类型的校验与规范化（含超限 BIGINT 的 bcmath 精确比较） |
+| `src/Query/` | `Table` 表访问入口、`SelectBuilder` 链式构建器、`Condition/` 条件模型（含 `SubqueryIn`/`ExistsCheck`/`ScalarSubquery`）、`ConditionEvaluator` 条件求值、`Agg` 聚合工厂、`Func`/`CaseWhen`/`ColumnRef`（投影表达式，实现 `ProjectionExpression`）、`WindowExpression`（窗口函数，整组计算）、`ViewDefinition`（视图定义 DTO 与结构化序列化）、`Explain`（静态计划分析）、`SelectQuery` 等 DTO |
+| `src/Execution/` | `Writer`（INSERT/UPDATE/DELETE 约束管线，含多表写）、`Executor`（SELECT 流水线，含窗口阶段与外部归并）、`IndexManager`（哈希索引缓存与预过滤）、`SubqueryResolver`（子查询解析，含相关绑定）、`TriggerManager`/`Trigger`（触发器分发与句柄） |
 | `src/Result/` | `ResultSet` 结果集、`InsertResult` 插入结果 |
-| `src/Storage/` | `StorageEngine` 接口、`MemoryEngine`、`JsonFileEngine`、`PagedJsonEngine`、`Codec`（压缩/加密编解码层）、`DirectoryLock`、`EngineSnapshot` |
+| `src/Storage/` | `StorageEngine` 接口、`MemoryEngine`、`JsonFileEngine`、`PhpSerializeEngine`、`PagedJsonEngine`、`Codec`（压缩/加密编解码层）、`DirectoryLock`（读写锁）、`LockingEngine`（操作级读写锁装饰器）、`WalEngine`（崩溃恢复装饰器）、`EngineSnapshot` |
 
 ## 执行模型
 
 - **哈希索引加速的等值查询**：WHERE 顶层条件全部为 AND 连接的等值比较且列集与某可用索引完全一致时，走 `IndexManager` 哈希预过滤（见下节）；未命中触发条件则回退全表线性扫描
 - **hash join**：等值 JOIN（INNER/LEFT/RIGHT）先构建哈希表再探测，复杂度 O(n+m)；非 '=' 运算符自动回退嵌套循环，输出顺序与嵌套循环实现一致
 - WHERE 求值采用 SQL NULL 三值逻辑；比较规则：两侧均数值性按数值、否则按字符串（区分大小写）
-- **子查询**：`whereIn`/`whereNotIn`/`whereExists`/`whereNotExists` 传入的子构建器经 `Execution\SubqueryResolver` 解析——作为独立查询完整执行（含自身 orderBy/limit/union）后，结果化为值列表或存在性判定进入常规条件求值；不支持相关子查询（引用外层列即未知列异常）
+- **子查询**：`whereIn`/`whereNotIn`/`whereExists`/`whereNotExists`/`whereScalar` 传入的子构建器经 `Execution\SubqueryResolver` 解析——非相关子查询作为独立查询完整执行（含自身 orderBy/limit/union）后，结果化为值列表 / 存在性判定 / 标量值进入常规条件求值；**相关子查询**（条件中 `whereColumn` 引用非子查询源别名的限定列）由 Executor 对外层行逐行 `resolveCorrelated`：把外层列引用替换为行值常量（支持列侧/值侧及运算符换侧翻转）后执行，嵌套相关由子查询自身执行递归处理
+- **标量子查询**：`whereScalar('col', '=', $sub)` 取子查询首行首列值与列比较；空集 → NULL（`col = NULL` 过滤行）
+- **CTE（WITH 非递归）**：`with()` 注册命名子查询；FROM 位由构建器预先解析为派生表，JOIN 位由 `Executor` 解析 CTE 源（物理表实时读、CTE 源用已执行结果），hash join 对 CTE 源同样可用
+- **窗口函数**：`WindowExpression`（`Func::rowNumber()/rank()/denseRank()` + `Agg::x()->over()`）在投影/聚合后由 `Executor::applyWindows` 整组计算——分区（PARTITION BY）→ 排序（ORDER BY）→ 排名或整分区聚合，结果写入输出行别名键（可继续 orderBy）；聚合窗口不做 ROWS BETWEEN 帧
+- **外部归并排序**：结果集超过内存阈值时 `orderBy` 自动改走外部归并（排序键分块写临时文件 + 多路归并，含淘汰重复排序键优化），阈值内仍内存排序，结果一致
 - **UNION / UNION ALL**：各子方作为独立查询完整执行（保留各自排序/limit 语义）后由 `Executor` 按声明序合并——UNION 全集去重保首见顺序、UNION ALL 保留重复；外层收尾子句（distinct/orderBy/limit/offset）作用于合并结果
 - **表达式投影**：`Query\ProjectionExpression` 接口（`Func`/`CaseWhen`/`ColumnRef` 实现）在投影阶段对源限定行求值，支持任意嵌套（NULL 传播、coalesce 除外）；别名进入输出行，可被 orderBy/having/groupBy 引用
 - **视图**：视图查询即把存储的结构化定义（`Query\ViewDefinition`）**水化**为 `SelectBuilder`，走与手写查询完全相同的常规流水线——没有独立的视图执行器
@@ -116,6 +120,7 @@ $db = Psql::connect('/data/appdb', ['compress' => true, 'key' => 'secret']); // 
 
 | 连接选项 | 类型 | 作用 |
 |---|---|---|
+| `engine` | `StorageEngine` | 自定义存储引擎实例，提供时直接使用（path 参数忽略）；与 `compress`/`key` 互斥（codec 由引擎内部配置） |
 | `compress` | bool | 落盘载荷经 `gzencode` 压缩，magic 头 `PGZ\x01` |
 | `key` | ?string | 落盘载荷 AES-256-CBC 加密，magic 头 `PENC\x01`（需 openssl 扩展） |
 
@@ -143,14 +148,37 @@ $restored = Psql::connect('/data/backup-2026-08-17');      // 备份目录即合
 - **排除锁文件**：`.lock` 不随备份复制
 - 加密库的备份同为密文，重新打开需提供原 key
 
-### 目录锁（多进程防护）
+### 目录锁（读写锁与多进程）
 
-`Storage\DirectoryLock` 提供数据目录级排他锁，防止多进程数据竞争：
+`Storage\DirectoryLock` 提供数据目录级 flock 读写锁：
 
-- 文件引擎（`FileEngine` 基类，即 JsonFile/PhpSerialize）与 `PagedJsonEngine` 构造时对 `<root>/.lock` 取 `flock` 排他锁
-- **跨进程互斥**：锁被其他进程持有时构造抛 `StorageException`（消息含 root）
-- **同进程引用计数**：同进程多次打开同 root 允许；但两个实例的内存缓存彼此独立，分别写盘可能读到陈旧数据——同进程需要多连接时应避免并行写同一表
+- 默认（无选项）：文件引擎（`FileEngine` 基类，即 JsonFile/PhpSerialize）与 `PagedJsonEngine` 构造时对 `<root>/.lock` 取**排他**锁（`acquire`，非阻塞，冲突抛 `StorageException`）——单进程独占
+- **单 writer 多 reader**（`['concurrency' => true]`）：引擎以 `acquireLock=false` 构造（跳过连接级排他锁），外包 `LockingEngine` 装饰器按操作加锁——读共享 `LOCK_SH`（`acquireBlocking` 阻塞等待）、写排他 `LOCK_EX`；同进程按 root 引用计数共享句柄、共享→排他同 fd 升级
+- 访问同一库目录的进程应**一致**使用并发模式（或一致用默认独占模式），避免混用
 - `MemoryEngine` 无锁；`.lock` 不是数据文件，不参与表枚举
+
+### 单 writer 多 reader 并发（v2.2）
+
+`LockingEngine`（`Storage\LockingEngine`，实现 `StorageEngine` 接口的装饰器）在每次引擎操作上做读写锁 + 跨进程缓存失效：
+
+- 每个 `StorageEngine` 方法按读写分类加阻塞锁（读 SH / 写 EX）；SELECT 经 `readLocked` 整语句持共享锁、写语句可经 `writeLocked` 整段持写锁
+- **事务全程持写锁**：`Connection::begin()` 调 `holdExclusive()`（阻塞等待 reader）、commit/rollBack 释放
+- 跨进程缓存失效：写操作后递增 `<root>/.wv` 版本、读操作前校验变化即清空内层引擎缓存（`invalidateCaches()`）——长驻 reader 能看到 writer 的新写入
+- 引擎需以 `acquireLock=false` 构造（跳过连接级生命周期锁）
+
+### WAL / 崩溃恢复（v2.3）
+
+`WalEngine`（`Storage\WalEngine`，装饰器）提供事务级崩溃恢复，全部文件引擎统一：
+
+- 写模型前提：各引擎"写穿"（每次写原子落盘），单文件/单页层面本就崩溃安全；真正缺口是**未提交事务的部分落盘**（崩溃时内存快照丢失）
+- `begin()` 把事务前全引擎快照（`inner->snapshot()`）**原子写入** `<root>/undo.snap` + `wal.log` 记 begin；commit/rollback 清理 `undo.snap`
+- 崩溃恢复：`Connection` 构造时调 `recoverIfNeeded()`——`undo.snap` 存在（上次有未提交事务崩溃）则恢复引擎并落盘、清理（排他锁保护）
+- 组合：`LockingEngine(WalEngine(engine))`——`Connection::walEngine()` 从 `LockingEngine` 内层穿透取事务钩子
+- 边界：进程级恢复（PHP 无可靠 fsync，断电级不保证）；已提交事务写穿即落盘无需 redo；增量备份仍缺（`wal.log` 为其前置）
+
+### 迁移工具（v2.2）
+
+`Schema\Migration`：`diff($target, $current)` 对比两连接库结构生成计划（建表/删表/加删改列/索引），`apply()` 顺序执行（复用 `Connection` 既有 DDL 校验与数据回填）。列改 NOT NULL 无默认值自动降级为 `note`；联合唯一/外键/CHECK 差异输出 `note`（AlterBlueprint 不支持增删）。
 
 ### 事务与快照
 
@@ -215,8 +243,10 @@ $connection = new Connection(new MyEngine());
 
 ## 范围外（路线图）
 
-- SQL 字符串解析器（`$db->query("SELECT ...")`）
+- SQL 字符串解析器（`$db->query("SELECT ...")`）与 CLI shell
 - B-Tree / 范围索引（当前哈希二级索引仅覆盖等值查询，范围查询仍扫描）
-- 排序外部归并（大表 ORDER BY 仍内存排序）
-- 存储过程、MVCC 并发、连接池（视图与触发器已于 v2.0 交付）
-- 完整 collation 体系（现仅列级 `ci()`）、JSON 列类型
+- 查询优化器（代价估算、连接顺序选择、谓词下推）
+- 隔离级别 / MVCC、多 writer 写写冲突检测（单 writer 多 reader 已交付）
+- 递归 CTE（`WITH RECURSIVE`）、聚合窗口的 `ROWS BETWEEN` 帧
+- 增量备份（`wal.log` 事务日志已为其前置）、fuzz 基准体系化
+- 完整 collation 体系（现仅列级 `ci()`）

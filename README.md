@@ -41,14 +41,17 @@ foreach ($rows as $row) {
 
 ## 特性
 
-- **MySQL 风格类型系统**：TINYINT/SMALLINT/INT/BIGINT（含 UNSIGNED）、DECIMAL(M,D)、FLOAT/DOUBLE、BOOLEAN、CHAR/VARCHAR/TEXT、ENUM、DATE/DATETIME/TIMESTAMP，写入时严格校验与规范化
-- **完整约束**：主键（单列与复合）、自增、NOT NULL、DEFAULT / CURRENT_TIMESTAMP、单列与联合唯一、外键（DELETE/UPDATE 各四策略）、CHECK 约束；文件引擎带目录级多进程锁
-- **链式查询**：WHERE 嵌套分组、子查询（IN/EXISTS）、UNION / UNION ALL、CASE 与函数表达式、列级 collation（ci）、INNER/LEFT/RIGHT JOIN、GROUP BY + HAVING、COUNT/SUM/AVG/MIN/MAX 聚合、ORDER BY、LIMIT/OFFSET、DISTINCT、LIKE 通配
-- **二级索引与 hash join 加速**：等值查询走哈希索引预过滤（主键/唯一约束列自动可用作索引），等值 JOIN 走哈希构建+探测；未命中自动回退全扫描，结果一致
+- **MySQL 风格类型系统**：TINYINT/SMALLINT/INT/BIGINT（含 UNSIGNED，超 PHP_INT_MAX 用十进制字符串 + bcmath 精确比较）、DECIMAL(M,D)、FLOAT/DOUBLE、BOOLEAN、CHAR/VARCHAR/TEXT、ENUM、JSON/BLOB/BINARY/SET、DATE/DATETIME/TIMESTAMP，写入时严格校验与规范化
+- **完整约束**：主键（单列与复合）、自增、NOT NULL、DEFAULT / CURRENT_TIMESTAMP、单列与联合唯一、外键（DELETE/UPDATE 各四策略）、CHECK 约束；文件引擎带目录级多进程锁（默认独占，可开单 writer 多 reader 读写锁）
+- **链式查询**：WHERE 嵌套分组、子查询（IN/EXISTS + 标量，含相关）、CTE（WITH 非递归命名子查询，FROM/JOIN 位引用）、UNION / UNION ALL、CASE 与函数表达式、窗口函数（ROW_NUMBER/RANK/DENSE_RANK + 聚合 OVER PARTITION BY）、列级 collation（ci）、INNER/LEFT/RIGHT JOIN（含自连接、ON 条件组、USING）、GROUP BY + HAVING、COUNT/SUM/AVG/MIN/MAX 聚合、ORDER BY、LIMIT/OFFSET、DISTINCT、LIKE 通配
+- **二级索引与 hash join 加速**：等值查询走哈希索引预过滤（主键/唯一约束列自动可用作索引），等值 JOIN 走哈希构建+探测；未命中自动回退全扫描，结果一致；大结果集 ORDER BY 自动外部归并（写临时文件分块 + 多路归并）
 - **NULL 三值逻辑**：与 SQL 一致——NULL 参与比较结果为未知（行被过滤），仅 `IS NULL` / `IS NOT NULL` 可匹配
-- **MySQL 风格写入**：INSERT（批内原子）、UPSERT / INSERT IGNORE、REPLACE INTO（冲突删旧插新）、INSERT ... SELECT（任意查询作源）、UPDATE / DELETE 带 ORDER BY + LIMIT
+- **MySQL 风格写入**：INSERT（批内原子）、UPSERT / INSERT IGNORE、REPLACE INTO（冲突删旧插新）、INSERT ... SELECT（任意查询作源）、UPDATE / DELETE 带 ORDER BY + LIMIT、多表 UPDATE / DELETE（JOIN 定位匹配行，SET 键 `别名.列` 限定目标表）
 - **事务**：`begin()/commit()/rollBack()`，快照隔离实现，支持回滚 DDL；savepoint 命名部分回滚
+- **单 writer 多 reader 并发**：`Psql::connect($dir, ['concurrency' => true])`——操作级读写锁（读共享/写排他）+ `.wv` 写版本跨进程缓存失效 + 事务全程持写锁；多进程可同时读、写进程间互斥
+- **WAL / 崩溃恢复**：`Psql::connect($dir, ['wal' => true])`——事务级 undo 快照（崩溃后重新打开自动回滚未提交事务）+ 事务日志；进程级崩溃恢复，可与并发模式组合
 - **数据库编程**：视图（`createView`/`view`，结构化持久化、事务可回滚）、PHP 闭包触发器（BEFORE/AFTER × INSERT/UPDATE/DELETE 六钩子）、savepoint、`explain()` 静态计划分析
+- **迁移工具**：`Migration::diff($target, $current)` 生成 schema 迁移计划、`Migration::apply` 顺序执行（建表/删表/加删改列/索引；NOT NULL 改动降级为手工提示）
 - **可插拔存储引擎**：MemoryEngine（纯内存）、JsonFileEngine（可读文件）、PhpSerializeEngine（高性能文件）、PagedJsonEngine（分页增量 + 墓碑删除），可实现 `StorageEngine` 接口自定义；支持静态压缩与加密（gzip / AES-256-CBC + HMAC）及 `backup()` 完整备份
 - **异常驱动**：任何失败（类型不合法、约束冲突、IO 损坏、误用）一律抛异常，绝不静默吞错；全库 `declare(strict_types=1)`
 
@@ -113,13 +116,15 @@ src/
 └── Storage/                  # StorageEngine 接口、Memory/JsonFile/PhpSerialize/PagedJson 引擎、目录锁
 ```
 
-## 测试
+## 测试与质量
 
 ```bash
-composer test
+composer test        # PHPUnit（999 项）
+composer analyse     # PHPStan（level 5）
+composer bench       # 存储引擎基准（php bench.php；CI 用 php bench.php --smoke）
 ```
 
-877 项单元/集成测试，覆盖类型、约束、DDL、DML、事务、持久化、索引、子查询/UNION/表达式、视图/触发器/savepoint/EXPLAIN、存储压缩/加密/备份、并发锁等体系。
+999 项单元/集成测试，覆盖类型、约束、DDL、DML、事务、持久化、索引、子查询/UNION/CTE/窗口函数/表达式、视图/触发器/savepoint/EXPLAIN、迁移工具、存储压缩/加密/备份、单 writer 多 reader 并发、WAL 崩溃恢复等体系；CI（GitHub Actions，PHP 8.2/8.3/8.4）自动跑 PHPUnit + PHPStan + bench smoke。
 
 ## License
 

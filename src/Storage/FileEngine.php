@@ -38,7 +38,14 @@ abstract class FileEngine implements StorageEngine
 
     protected string $root;
 
-    public function __construct(string $root, private Codec $codec = new Codec())
+    /** 是否持有连接级生命周期锁（并发模式为 false，改由 LockingEngine 操作级加锁） */
+    private bool $lockHeld = false;
+
+    /**
+     * @param bool $acquireLock false 时跳过连接级排他锁（供单 writer 多 reader 并发模式，
+     *        由 LockingEngine 装饰器按操作加锁）
+     */
+    public function __construct(string $root, private Codec $codec = new Codec(), bool $acquireLock = true)
     {
         $this->root = rtrim($root, '/\\');
         if ($this->root === '') {
@@ -50,12 +57,26 @@ abstract class FileEngine implements StorageEngine
         if (!is_writable($this->root)) {
             throw new StorageException("根目录不可写: {$this->root}");
         }
-        DirectoryLock::acquire($this->root);
+        if ($acquireLock) {
+            DirectoryLock::acquire($this->root);
+            $this->lockHeld = true;
+        }
     }
 
     public function __destruct()
     {
-        DirectoryLock::release($this->root);
+        if ($this->lockHeld) {
+            DirectoryLock::release($this->root);
+        }
+    }
+
+    /**
+     * 清空进程内缓存（跨进程一致性：另一进程写入后由 LockingEngine 按 .wv 版本触发）
+     */
+    public function invalidateCaches(): void
+    {
+        $this->cache = [];
+        $this->viewCache = [];
     }
 
     /**

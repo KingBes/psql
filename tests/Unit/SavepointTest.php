@@ -253,15 +253,17 @@ final class SavepointTest extends TestCase
         });
         $connection->table('extra')->insert(['memo' => 'x']);
         $connection->createView('user_names', $connection->table('users')->select('id', 'name'));
+        // 先删视图再删基表：视图引用校验（dropTable 拒绝被视图引用的基表）与 DDL 回滚两不冲突
+        $connection->dropView('user_names');
         $connection->dropTable('users');
 
         $this->assertTrue($connection->hasTable('extra'));
-        $this->assertTrue($connection->hasView('user_names'));
+        $this->assertFalse($connection->hasView('user_names'));
         $this->assertFalse($connection->hasTable('users'));
 
         $connection->rollBackTo('sp');
 
-        // 结构变更全部撤销：新表/新视图消失，被删表恢复（含数据）
+        // 结构变更全部撤销：保存点后创建的新表/新视图消失，被删基表恢复（含数据）
         $this->assertFalse($connection->hasTable('extra'));
         $this->assertFalse($connection->hasView('user_names'));
         $this->assertTrue($connection->hasTable('users'));

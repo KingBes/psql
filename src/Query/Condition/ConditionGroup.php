@@ -6,6 +6,8 @@ namespace Kingbes\Psql\Query\Condition;
 
 use Kingbes\Psql\Exception\QueryException;
 use Kingbes\Psql\Exception\StorageException;
+use Kingbes\Psql\Query\ColumnRef;
+use Kingbes\Psql\Query\SelectBuilder;
 
 /**
  * 条件组：多个条件按 AND/OR 自左向右连接
@@ -34,6 +36,14 @@ final class ConditionGroup extends Condition
         return $this->add(self::comparison($column, $args), 'OR');
     }
 
+    /**
+     * 列 vs 列 的比较条件（AND 连接）：右侧以列引用求值，如 whereColumn('a.id', '=', 'b.a_id')
+     */
+    public function whereColumn(string $left, string $operator, string $right): static
+    {
+        return $this->add(new Comparison($left, $operator, new ColumnRef($right)), 'AND');
+    }
+
     public function whereIn(string $column, array $values): static
     {
         return $this->add(new InList($column, $values), 'AND');
@@ -42,6 +52,22 @@ final class ConditionGroup extends Condition
     public function whereNotIn(string $column, array $values): static
     {
         return $this->add(new InList($column, $values, true), 'AND');
+    }
+
+    /**
+     * 标量子查询条件（AND 语义）：列 运算符 (子查询)，子查询须输出 1 列
+     */
+    public function whereScalar(string $column, string $operator, SelectBuilder $sub): static
+    {
+        return $this->add(new ScalarSubquery($column, $operator, $sub->toQuery()), 'AND');
+    }
+
+    /**
+     * 标量子查询条件（OR 语义）
+     */
+    public function orWhereScalar(string $column, string $operator, SelectBuilder $sub): static
+    {
+        return $this->add(new ScalarSubquery($column, $operator, $sub->toQuery()), 'OR');
     }
 
     public function whereBetween(string $column, mixed $min, mixed $max): static

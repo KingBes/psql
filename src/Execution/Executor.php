@@ -9,13 +9,19 @@ use Kingbes\Psql\Exception\QueryException;
 use Kingbes\Psql\Exception\StorageException;
 use Kingbes\Psql\Query\AggregateExpression;
 use Kingbes\Psql\Query\Condition\Comparison;
+use Kingbes\Psql\Query\Condition\Condition;
 use Kingbes\Psql\Query\Condition\ConditionGroup;
+use Kingbes\Psql\Query\Condition\ExistsCheck;
+use Kingbes\Psql\Query\Condition\ScalarSubquery;
+use Kingbes\Psql\Query\Condition\SubqueryIn;
 use Kingbes\Psql\Query\ConditionEvaluator;
 use Kingbes\Psql\Query\JoinClause;
 use Kingbes\Psql\Query\SelectQuery;
 use Kingbes\Psql\Query\UnionClause;
+use Kingbes\Psql\Query\WindowExpression;
 use Kingbes\Psql\Result\ResultSet;
 use Kingbes\Psql\Schema\TableSchema;
+use Kingbes\Psql\Type\ValueCaster;
 
 /**
  * 查询执行器：限定行构建 → JOIN → WHERE → 分组聚合/HAVING → 投影 → DISTINCT → 排序 → 分页
@@ -25,44 +31,57 @@ final class Executor
     /** 纯数字形式：可选符号 + 整数/小数 */
     private const NUMERIC_PATTERN = '/^[+-]?(\d+(\.\d*)?|\.\d+)$/';
 
+    /** 外部归并：单块最大行数（超过此值写临时文件分块排序） */
+    private const EXTERNAL_SORT_CHUNK_ROWS = 5000;
+
     public function __construct(private Connection $connection)
     {
     }
 
     public function execute(SelectQuery $query): ResultSet
     {
+        // 并发模式：整语句持共享锁（单 writer 多 reader 语句级一致性）
+        return $this->connection->readLocked(fn (): ResultSet => $this->executeLocked($query));
+    }
+
+    private function executeLocked(SelectQuery $query): ResultSet
+    {
         $db = $this->connection->currentDatabase();
         $engine = $this->connection->engine();
 
-        // 源列表：基表 + 各 join 表（alias = 显式别名 ?: 表名）
+        // 源列表：基表/派生表 + 各 join 表（alias = 显式别名 ?: 表名）
         $sources = [];
-        $base = $this->appendSource($sources, $db, $query->table, $query->alias);
+        $base = $this->appendSource($sources, $db, $query);
 
-        // 限定行构建：键改为 'alias.列名'（等值索引可命中时仅加载候选行，行号升序保持原序）
+        // 限定行构建：键改为 'alias.列名'（物理表等值索引可命中时仅加载候选行，行号升序保持原序）
         $rows = [];
-        $allRows = $engine->readRows($db, $query->table);
-        $candidates = $this->candidateRowIndexes($query, $base['schema']);
-        $indexes = $candidates ?? array_keys($allRows);
-        foreach ($indexes as $index) {
-            $rows[] = $this->qualify($base['alias'], $allRows[$index], $base['schema']);
+        if ($base['table'] !== null) {
+            $allRows = $engine->readRows($db, $base['table']);
+            $candidates = $this->candidateRowIndexes($query, $base['schema']);
+            $indexes = $candidates ?? array_keys($allRows);
+            foreach ($indexes as $index) {
+                $rows[] = $this->qualify($base['alias'], $allRows[$index], $base['columns']);
+            }
+        } else {
+            // 派生表：子查询已完整执行，输出行按子查询输出列名限定
+            foreach ($base['rows'] as $subRow) {
+                $rows[] = $this->qualify($base['alias'], $subRow, $base['columns']);
+            }
         }
 
         // JOIN 按声明顺序逐个应用（嵌套循环）
         foreach ($query->joins as $join) {
-            $source = $this->appendSource($sources, $db, $join->table, $join->alias);
+            $source = $this->appendSource($sources, $db, $this->joinSourceQuery($query, $join));
             $rows = $this->applyJoin($rows, $source, $join, $sources);
         }
 
         // 全部源的 CI 列映射（WHERE 过滤与 ORDER BY 排序共用）
         $collations = $this->collationsOf($sources);
 
-        // WHERE（null → 全保留）；子查询条件先经 SubqueryResolver 解析为可求值条件
+        // WHERE（null → 全保留）；子查询条件先经 SubqueryResolver 解析为可求值条件；
+        // 含相关子查询时对外层行逐行绑定求值（resolveCorrelated）
         if ($query->where !== null) {
-            $where = (new SubqueryResolver($this->connection))->resolve($query->where);
-            $rows = array_values(array_filter(
-                $rows,
-                static fn (array $row): bool => ConditionEvaluator::evaluate($row, $where, $collations),
-            ));
+            $rows = $this->filterWhere($rows, $query->where, $collations);
         }
 
         // 分组聚合 / 普通投影
@@ -70,6 +89,11 @@ final class Executor
             $entries = $this->aggregate($rows, $query);
         } else {
             $entries = $this->project($rows, $query, $sources);
+        }
+
+        // 窗口函数（投影/聚合后整组计算，结果写入输出行别名键）
+        if ($query->windows !== []) {
+            $entries = $this->applyWindows($entries, $query->windows, $collations);
         }
 
         // 基础方收尾（DISTINCT → ORDER → LIMIT/OFFSET，语义 = 各方先各自出结果）
@@ -87,65 +111,228 @@ final class Executor
         ));
     }
 
+    /**
+     * 执行到"限定行 + WHERE 过滤"为止的匹配行（多表 UPDATE/DELETE 写入路径用）：
+     * 返回按源引入顺序合并的限定行（'alias.列名' 键），不含投影/聚合/排序/分页。
+     * 判定逻辑与 execute 的基表构建 + JOIN + WHERE 段镜像同步（含索引预过滤与子查询条件解析）
+     *
+     * @return list<array<string,mixed>>
+     */
+    public function matchedRows(SelectQuery $query): array
+    {
+        // 并发模式：整语句持共享锁（多表写入定位与 SELECT 同级一致性）
+        return $this->connection->readLocked(fn (): array => $this->matchedRowsLocked($query));
+    }
+
+    private function matchedRowsLocked(SelectQuery $query): array
+    {
+        $db = $this->connection->currentDatabase();
+        $engine = $this->connection->engine();
+
+        $sources = [];
+        $base = $this->appendSource($sources, $db, $query);
+
+        $rows = [];
+        if ($base['table'] !== null) {
+            $allRows = $engine->readRows($db, $base['table']);
+            $candidates = $this->candidateRowIndexes($query, $base['schema']);
+            $indexes = $candidates ?? array_keys($allRows);
+            foreach ($indexes as $index) {
+                $rows[] = $this->qualify($base['alias'], $allRows[$index], $base['columns']);
+            }
+        } else {
+            foreach ($base['rows'] as $subRow) {
+                $rows[] = $this->qualify($base['alias'], $subRow, $base['columns']);
+            }
+        }
+
+        foreach ($query->joins as $join) {
+            $source = $this->appendSource($sources, $db, $this->joinSourceQuery($query, $join));
+            $rows = $this->applyJoin($rows, $source, $join, $sources);
+        }
+
+        $collations = $this->collationsOf($sources);
+        if ($query->where !== null) {
+            $rows = $this->filterWhere($rows, $query->where, $collations);
+        }
+
+        return $rows;
+    }
+
+    /**
+     * WHERE 过滤：非相关子查询整体解析一次批量求值；含相关子查询时逐行
+     * resolveCorrelated（把外层列引用替换为行值后执行）再求值
+     *
+     * @param list<array<string,mixed>> $rows
+     * @param array<string, true> $collations
+     * @return list<array<string,mixed>>
+     */
+    private function filterWhere(array $rows, Condition $where, array $collations): array
+    {
+        if (!$this->whereNeedsRowBinding($where)) {
+            $resolved = (new SubqueryResolver($this->connection))->resolve($where);
+
+            return array_values(array_filter(
+                $rows,
+                static fn (array $row): bool => ConditionEvaluator::evaluate($row, $resolved, $collations),
+            ));
+        }
+
+        $resolver = new SubqueryResolver($this->connection);
+
+        return array_values(array_filter(
+            $rows,
+            fn (array $row): bool => ConditionEvaluator::evaluate(
+                $row,
+                $resolver->resolveCorrelated($where, $row),
+                $collations,
+            ),
+        ));
+    }
+
+    /**
+     * 条件树是否含相关子查询（需逐行绑定）
+     */
+    private function whereNeedsRowBinding(Condition $where): bool
+    {
+        if ($where instanceof ConditionGroup) {
+            foreach ($where->conditions as $child) {
+                if ($this->whereNeedsRowBinding($child)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+        if ($where instanceof SubqueryIn || $where instanceof ExistsCheck || $where instanceof ScalarSubquery) {
+            return SubqueryResolver::isCorrelated($where->query);
+        }
+
+        return false;
+    }
+
     // ---- 源与限定行 ----
 
     /**
-     * 追加查询源；表不存在转抛 QueryException，别名重复抛 QueryException
-     *
-     * @param list<array{alias: string, schema: TableSchema}> $sources
-     * @return array{alias: string, schema: TableSchema}
+     * 连接源查询：物理表直接构造表查询；CTE 源从查询的 ctes 注册表解析定义为派生表
+     * （table 作别名占位、fromSub 为 CTE 定义；未知 CTE 抛 QueryException）
      */
-    private function appendSource(array &$sources, string $db, string $table, ?string $alias): array
+    private function joinSourceQuery(SelectQuery $query, JoinClause $join): SelectQuery
     {
-        $alias ??= $table;
-        foreach ($sources as $source) {
-            if ($source['alias'] === $alias) {
-                throw new QueryException("表别名重复: {$alias}");
-            }
+        if ($join->cte === null) {
+            return new SelectQuery($join->table, $join->alias);
         }
-        try {
-            $schema = $this->connection->engine()->loadSchema($db, $table);
-        } catch (StorageException) {
-            throw new QueryException("表不存在: {$db}.{$table}");
+        if (!isset($query->ctes[$join->cte])) {
+            throw new QueryException("未知 CTE: {$join->cte}");
+        }
+        $alias = $join->alias ?? $join->table;
+
+        return new SelectQuery($alias, $alias, fromSub: $query->ctes[$join->cte]);
+    }
+
+    /**
+     * 连接源行：派生表/CTE 源取已执行结果（rows），物理表源按表名实时读取
+     *
+     * @param array{alias: string, table: ?string, columns: list<string>, ci: array<string, true>, schema: ?TableSchema, rows?: list<array<string,mixed>>} $source
+     * @return list<array<string,mixed>>
+     */
+    private function joinSourceRows(array $source): array
+    {
+        if (isset($source['rows'])) {
+            return $source['rows'];
         }
 
-        $source = ['alias' => $alias, 'schema' => $schema];
+        return $this->connection->engine()->readRows($this->connection->currentDatabase(), $source['table']);
+    }
+
+    /**
+     * 追加查询源；物理表加载结构（不存在抛 QueryException），派生表执行子查询取输出列；
+     * 别名重复抛 QueryException
+     *
+     * @param list<array{alias: string, table: ?string, columns: list<string>, ci: array<string, true>, schema: ?TableSchema, rows?: list<array<string,mixed>>}> $sources
+     * @return array{alias: string, table: ?string, columns: list<string>, ci: array<string, true>, schema: ?TableSchema, rows?: list<array<string,mixed>>}
+     */
+    private function appendSource(array &$sources, string $db, SelectQuery $query): array
+    {
+        if ($query->fromSub !== null) {
+            // 派生表：子查询完整执行，输出列即源列（无 CI、无结构 schema、无索引加速）
+            $alias = $query->table;
+            $this->assertAliasUnique($sources, $alias);
+            $rows = (new self($this->connection))->execute($query->fromSub)->rows();
+            $columns = $rows === [] ? [] : array_keys($rows[0]);
+            $source = ['alias' => $alias, 'table' => null, 'columns' => $columns, 'ci' => [], 'schema' => null, 'rows' => $rows];
+            $sources[] = $source;
+
+            return $source;
+        }
+
+        $alias = $query->alias ?? $query->table;
+        $this->assertAliasUnique($sources, $alias);
+        try {
+            $schema = $this->connection->engine()->loadSchema($db, $query->table);
+        } catch (StorageException) {
+            throw new QueryException("表不存在: {$db}.{$query->table}");
+        }
+
+        $columns = [];
+        $ci = [];
+        foreach ($schema->columns as $column) {
+            $columns[] = $column->name;
+            if ($column->ci) {
+                $ci[$column->name] = true;
+            }
+        }
+
+        $source = ['alias' => $alias, 'table' => $query->table, 'columns' => $columns, 'ci' => $ci, 'schema' => $schema];
         $sources[] = $source;
 
         return $source;
     }
 
     /**
-     * 行键加 'alias.' 前缀（按结构列序全展开）
+     * 别名重复校验（派生表/物理表统一）
      *
+     * @param list<array{alias: string}> $sources
+     */
+    private function assertAliasUnique(array $sources, string $alias): void
+    {
+        foreach ($sources as $source) {
+            if ($source['alias'] === $alias) {
+                throw new QueryException("表别名重复: {$alias}");
+            }
+        }
+    }
+
+    /**
+     * 行键加 'alias.' 前缀（按列名列表全展开；物理表=结构列序，派生表=子查询输出列序）
+     *
+     * @param list<string> $columns
      * @return array<string,mixed>
      */
-    private function qualify(string $alias, array $row, TableSchema $schema): array
+    private function qualify(string $alias, array $row, array $columns): array
     {
         $qualified = [];
-        foreach ($schema->columns as $column) {
-            $qualified[$alias . '.' . $column->name] = $row[$column->name] ?? null;
+        foreach ($columns as $name) {
+            $qualified[$alias . '.' . $name] = $row[$name] ?? null;
         }
 
         return $qualified;
     }
 
     /**
-     * 收集全部源（基表 + join 表）的 CI 列映射：限定名 'alias.列名' 与裸列名均注册 true；
+     * 收集全部源（基表/派生表 + join 表）的 CI 列映射：限定名 'alias.列名' 与裸列名均注册 true；
      * 裸名多源同名列一 CI 一 CS 时取"任一 CI 即 CI"（保守：需要消歧请使用限定列名比较）
      *
-     * @param list<array{alias: string, schema: TableSchema}> $sources
+     * @param list<array{alias: string, table: ?string, columns: list<string>, ci: array<string, true>, schema: ?TableSchema, rows?: list<array<string,mixed>>}> $sources
      * @return array<string, true>
      */
     private function collationsOf(array $sources): array
     {
         $collations = [];
         foreach ($sources as $source) {
-            foreach ($source['schema']->columns as $column) {
-                if ($column->ci) {
-                    $collations[$source['alias'] . '.' . $column->name] = true;
-                    $collations[$column->name] = true;
-                }
+            foreach (array_keys($source['ci']) as $name) {
+                $collations[$source['alias'] . '.' . $name] = true;
+                $collations[$name] = true;
             }
         }
 
@@ -223,12 +410,17 @@ final class Executor
      * 输出顺序与嵌套循环语义一致（外层行序 × 桶内原序）
      *
      * @param list<array<string,mixed>> $rows 已累积限定行
-     * @param array{alias: string, schema: TableSchema} $source 本次 join 引入的源
-     * @param list<array{alias: string, schema: TableSchema}> $sources 全部源（本次源在末尾）
+     * @param array{alias: string, table: ?string, columns: list<string>, ci: array<string, true>, schema: ?TableSchema, rows?: list<array<string,mixed>>} $source 本次 join 引入的源
+     * @param list<array{alias: string, table: ?string, columns: list<string>, ci: array<string, true>, schema: ?TableSchema, rows?: list<array<string,mixed>>}> $sources 全部源（本次源在末尾）
      * @return list<array<string,mixed>>
      */
     private function applyJoin(array $rows, array $source, JoinClause $join, array $sources): array
     {
+        if ($join->on !== null) {
+            // 任意 ON 条件表达式：嵌套循环在合并行上按条件组求值（正确性优先，不做 hash 加速）
+            return $this->nestedLoopJoin($rows, $source, $join, $sources, false, $this->collationsOf($sources));
+        }
+
         if ($join->operator === '=') {
             if (!$this->joinUsesCI($sources, $source, $join)) {
                 return $join->type === 'RIGHT'
@@ -246,8 +438,8 @@ final class Executor
     /**
      * ON 等值两侧是否涉及 CI 列：左列在既有累积源中解析、右列在被 join 表 schema 中解析
      *
-     * @param list<array{alias: string, schema: TableSchema}> $sources
-     * @param array{alias: string, schema: TableSchema} $source
+     * @param list<array{alias: string, table: ?string, columns: list<string>, ci: array<string, true>, schema: ?TableSchema, rows?: list<array<string,mixed>>}> $sources
+     * @param array{alias: string, table: ?string, columns: list<string>, ci: array<string, true>, schema: ?TableSchema, rows?: list<array<string,mixed>>} $source
      */
     private function joinUsesCI(array $sources, array $source, JoinClause $join): bool
     {
@@ -258,7 +450,7 @@ final class Executor
     /**
      * 列在给定源集中是否 CI：限定名仅查对应别名源；裸名任一源命中 CI 列即视为 CI（保守回退）
      *
-     * @param list<array{alias: string, schema: TableSchema}> $sources
+     * @param list<array{alias: string, table: ?string, columns: list<string>, ci: array<string, true>, schema: ?TableSchema, rows?: list<array<string,mixed>>}> $sources
      */
     private function columnIsCI(array $sources, string $column): bool
     {
@@ -268,13 +460,7 @@ final class Executor
             $name = substr($column, $pos + 1);
             foreach ($sources as $item) {
                 if ($item['alias'] === $alias) {
-                    foreach ($item['schema']->columns as $schemaColumn) {
-                        if ($schemaColumn->name === $name) {
-                            return $schemaColumn->ci;
-                        }
-                    }
-
-                    return false;
+                    return isset($item['ci'][$name]);
                 }
             }
 
@@ -282,10 +468,8 @@ final class Executor
         }
 
         foreach ($sources as $item) {
-            foreach ($item['schema']->columns as $schemaColumn) {
-                if ($schemaColumn->name === $column && $schemaColumn->ci) {
-                    return true;
-                }
+            if (isset($item['ci'][$column])) {
+                return true;
             }
         }
 
@@ -298,15 +482,14 @@ final class Executor
      * 桶内按右行原序追加，输出顺序 = 左行序 × 桶内右序（与嵌套循环一致）
      *
      * @param list<array<string,mixed>> $rows
-     * @param array{alias: string, schema: TableSchema} $source
+     * @param array{alias: string, table: ?string, columns: list<string>, ci: array<string, true>, schema: ?TableSchema, rows?: list<array<string,mixed>>} $source
      * @return list<array<string,mixed>>
      */
     private function hashLeftJoin(array $rows, array $source, JoinClause $join): array
     {
-        $db = $this->connection->currentDatabase();
         $buckets = [];
-        foreach ($this->connection->engine()->readRows($db, $join->table) as $row) {
-            $joinRow = $this->qualify($source['alias'], $row, $source['schema']);
+        foreach ($this->joinSourceRows($source) as $row) {
+            $joinRow = $this->qualify($source['alias'], $row, $source['columns']);
             $key = $this->resolveColumn($joinRow, $join->rightColumn);
             // JOIN on null 永不匹配，null 键行不进桶
             if ($key !== null) {
@@ -316,8 +499,8 @@ final class Executor
 
         // LEFT 无匹配时右侧各列 null
         $nullRight = [];
-        foreach ($source['schema']->columns as $column) {
-            $nullRight[$source['alias'] . '.' . $column->name] = null;
+        foreach ($source['columns'] as $name) {
+            $nullRight[$source['alias'] . '.' . $name] = null;
         }
 
         $result = [];
@@ -343,8 +526,8 @@ final class Executor
      * 输出顺序 = 右行序 × 桶内左序（与嵌套循环右外层实现一致）
      *
      * @param list<array<string,mixed>> $rows
-     * @param array{alias: string, schema: TableSchema} $source
-     * @param list<array{alias: string, schema: TableSchema}> $sources
+     * @param array{alias: string, table: ?string, columns: list<string>, ci: array<string, true>, schema: ?TableSchema, rows?: list<array<string,mixed>>} $source
+     * @param list<array{alias: string, table: ?string, columns: list<string>, ci: array<string, true>, schema: ?TableSchema, rows?: list<array<string,mixed>>}> $sources
      * @return list<array<string,mixed>>
      */
     private function hashRightJoin(array $rows, array $source, JoinClause $join, array $sources): array
@@ -357,20 +540,19 @@ final class Executor
             }
         }
 
-        // 左无匹配时左侧各列 null（全部既有源的列展开）
+        // 左无匹配时左侧各列 null（全部既有源的列展开，兼容派生表/CTE 源）
         $leftKeys = [];
         $count = count($sources) - 1;
         for ($i = 0; $i < $count; $i++) {
-            foreach ($sources[$i]['schema']->columns as $column) {
-                $leftKeys[] = $sources[$i]['alias'] . '.' . $column->name;
+            foreach ($sources[$i]['columns'] as $name) {
+                $leftKeys[] = $sources[$i]['alias'] . '.' . $name;
             }
         }
         $nullLeft = array_fill_keys($leftKeys, null);
 
-        $db = $this->connection->currentDatabase();
         $result = [];
-        foreach ($this->connection->engine()->readRows($db, $join->table) as $row) {
-            $joinRow = $this->qualify($source['alias'], $row, $source['schema']);
+        foreach ($this->joinSourceRows($source) as $row) {
+            $joinRow = $this->qualify($source['alias'], $row, $source['columns']);
             $right = $this->resolveColumn($joinRow, $join->rightColumn);
             $matched = false;
             if ($right !== null) {
@@ -388,20 +570,21 @@ final class Executor
     }
 
     /**
-     * 嵌套循环连接（非等值运算符回退路径 / CI 列等值路径）；
-     * ON 条件用 compareValues(leftVal, op, rightVal, ci) 求值，CI 时两侧值折叠后比较
+     * 嵌套循环连接（非等值运算符回退路径 / CI 列等值路径 / 任意 ON 条件表达式）；
+     * 简单比较 ON 用 compareValues(leftVal, op, rightVal, ci) 求值；
+     * 任意条件表达式 ON 用 ConditionEvaluator::evaluate 在合并行上求值
      *
      * @param list<array<string,mixed>> $rows 已累积限定行
-     * @param array{alias: string, schema: TableSchema} $source 本次 join 引入的源
-     * @param list<array{alias: string, schema: TableSchema}> $sources 全部源（本次源在末尾）
+     * @param array{alias: string, table: ?string, columns: list<string>, ci: array<string, true>, schema: ?TableSchema, rows?: list<array<string,mixed>>} $source 本次 join 引入的源
+     * @param list<array{alias: string, table: ?string, columns: list<string>, ci: array<string, true>, schema: ?TableSchema, rows?: list<array<string,mixed>>}> $sources 全部源（本次源在末尾）
+     * @param array<string, true>|null $collations ON 条件表达式求值用的 CI 映射
      * @return list<array<string,mixed>>
      */
-    private function nestedLoopJoin(array $rows, array $source, JoinClause $join, array $sources, bool $ci = false): array
+    private function nestedLoopJoin(array $rows, array $source, JoinClause $join, array $sources, bool $ci = false, ?array $collations = null): array
     {
-        $db = $this->connection->currentDatabase();
         $joinRows = [];
-        foreach ($this->connection->engine()->readRows($db, $join->table) as $row) {
-            $joinRows[] = $this->qualify($source['alias'], $row, $source['schema']);
+        foreach ($this->joinSourceRows($source) as $row) {
+            $joinRows[] = $this->qualify($source['alias'], $row, $source['columns']);
         }
 
         $result = [];
@@ -410,15 +593,15 @@ final class Executor
             $leftKeys = [];
             $count = count($sources) - 1;
             for ($i = 0; $i < $count; $i++) {
-                foreach ($sources[$i]['schema']->columns as $column) {
-                    $leftKeys[] = $sources[$i]['alias'] . '.' . $column->name;
+                foreach ($sources[$i]['columns'] as $name) {
+                    $leftKeys[] = $sources[$i]['alias'] . '.' . $name;
                 }
             }
             $nullLeft = array_fill_keys($leftKeys, null);
             foreach ($joinRows as $joinRow) {
                 $matched = false;
                 foreach ($rows as $row) {
-                    if ($this->joinMatch($row, $joinRow, $join, $ci)) {
+                    if ($this->joinMatch($row, $joinRow, $join, $ci, $collations)) {
                         $result[] = array_merge($row, $joinRow);
                         $matched = true;
                     }
@@ -433,13 +616,13 @@ final class Executor
 
         // INNER / LEFT：左为外层；LEFT 无匹配时右侧各列 null
         $nullRight = [];
-        foreach ($source['schema']->columns as $column) {
-            $nullRight[$source['alias'] . '.' . $column->name] = null;
+        foreach ($source['columns'] as $name) {
+            $nullRight[$source['alias'] . '.' . $name] = null;
         }
         foreach ($rows as $row) {
             $matched = false;
             foreach ($joinRows as $joinRow) {
-                if ($this->joinMatch($row, $joinRow, $join, $ci)) {
+                if ($this->joinMatch($row, $joinRow, $join, $ci, $collations)) {
                     $result[] = array_merge($row, $joinRow);
                     $matched = true;
                 }
@@ -453,10 +636,14 @@ final class Executor
     }
 
     /**
-     * ON 条件求值：left 在已累积行中解析，right 在被 join 表行中解析；CI 时折叠比较
+     * ON 条件求值：简单比较解析两侧列值后 compareValues；任意条件表达式在合并行上 evaluate
      */
-    private function joinMatch(array $row, array $joinRow, JoinClause $join, bool $ci = false): bool
+    private function joinMatch(array $row, array $joinRow, JoinClause $join, bool $ci = false, ?array $collations = null): bool
     {
+        if ($join->on !== null) {
+            return ConditionEvaluator::evaluate(array_merge($row, $joinRow), $join->on, $collations);
+        }
+
         $left = $this->resolveColumn($row, $join->leftColumn);
         $right = $this->resolveColumn($joinRow, $join->rightColumn);
 
@@ -591,7 +778,7 @@ final class Executor
             for ($i = 1, $count = count($values); $i < $count; $i++) {
                 $candidate = $values[$i];
                 $cmp = $allNumeric
-                    ? (float) $candidate <=> (float) $best
+                    ? ValueCaster::compareNumeric($candidate, $best)
                     : (string) $candidate <=> (string) $best;
                 if (($function === 'MIN' && $cmp < 0) || ($function === 'MAX' && $cmp > 0)) {
                     $best = $candidate;
@@ -624,7 +811,7 @@ final class Executor
      * 普通投影（无聚合无分组）
      *
      * @param list<array<string,mixed>> $rows
-     * @param list<array{alias: string, schema: TableSchema}> $sources
+     * @param list<array{alias: string, table: ?string, columns: list<string>, ci: array<string, true>, schema: ?TableSchema, rows?: list<array<string,mixed>>}> $sources
      * @return list<array{output: array<string,mixed>, source: array<string,mixed>}>
      */
     private function project(array $rows, SelectQuery $query, array $sources): array
@@ -633,8 +820,8 @@ final class Executor
         $columns = $query->columns;
         if ($columns === [] && $query->expressions === []) {
             foreach ($sources as $source) {
-                foreach ($source['schema']->columns as $column) {
-                    $columns[] = $source['alias'] . '.' . $column->name;
+                foreach ($source['columns'] as $name) {
+                    $columns[] = $source['alias'] . '.' . $name;
                 }
             }
         }
@@ -678,6 +865,222 @@ final class Executor
     }
 
     // ---- DISTINCT / 排序 ----
+
+    /**
+     * 窗口函数计算：按 partitionBy 分组、orderBy 排序后，为每行计算窗口函数值并写入输出行。
+     * 排名函数（ROW_NUMBER/RANK/DENSE_RANK）需 ORDER BY（缺省抛 QueryException）；
+     * 聚合窗口（COUNT/SUM/AVG/MIN/MAX）无 ORDER BY 时整分区统计算值（不做 ROWS BETWEEN 帧）
+     *
+     * @param list<array{output: array<string,mixed>, source: array<string,mixed>}> $entries
+     * @param list<WindowExpression> $windows
+     * @param array<string, true> $collations
+     * @return list<array{output: array<string,mixed>, source: array<string,mixed>}>
+     */
+    private function applyWindows(array $entries, array $windows, array $collations): array
+    {
+        $outputKeys = $entries === [] ? [] : array_keys($entries[0]['output']);
+
+        foreach ($windows as $window) {
+            $name = $window->alias() ?? $window->function;
+            if (in_array($name, $outputKeys, true)) {
+                throw new QueryException("输出列名冲突: {$name}");
+            }
+            if ($window->isRanking() && $window->orderBy === []) {
+                throw new QueryException("排名函数 {$window->function} 必须指定 ORDER BY");
+            }
+
+            // 分区索引
+            $partitions = [];
+            foreach ($entries as $i => $entry) {
+                if ($window->partitionBy === []) {
+                    $key = '';
+                } else {
+                    $parts = [];
+                    foreach ($window->partitionBy as $col) {
+                        $parts[] = self::resolveSortValue($entry, $col, $outputKeys);
+                    }
+                    $key = json_encode($parts, JSON_UNESCAPED_UNICODE);
+                }
+                $partitions[$key][] = $i;
+            }
+
+            // 各分区排序后计算
+            $results = [];
+            foreach ($partitions as $key => $indices) {
+                $sorted = $indices;
+                if ($window->orderBy !== []) {
+                    $specs = self::resolveSortSpecs($window->orderBy, $outputKeys, $collations);
+                    usort($sorted, function (int $a, int $b) use ($entries, $specs): int {
+                        foreach ($specs as $spec) {
+                            $cmp = $this->compare(
+                                $this->sortValue($entries[$a], $spec),
+                                $this->sortValue($entries[$b], $spec),
+                                $spec['ci'],
+                            );
+                            if ($cmp !== 0) {
+                                return $spec['direction'] === 'DESC' ? -$cmp : $cmp;
+                            }
+                        }
+
+                        return $a <=> $b;
+                    });
+                }
+
+                if ($window->isRanking()) {
+                    $this->computeRanking($window, $sorted, $entries, $results);
+                } else {
+                    $this->computeAggregateWindow($window, $sorted, $entries, $results);
+                }
+            }
+
+            // 按原序写入输出
+            foreach ($results as $i => $value) {
+                $entries[$i]['output'][$name] = $value;
+            }
+            $outputKeys[] = $name;
+        }
+
+        return $entries;
+    }
+
+    /**
+     * 排名函数计算（ROW_NUMBER → 连续序号；RANK → 同值并列留空档；DENSE_RANK → 同值并列不留空档）
+     *
+     * @param list<int> $sorted 分区内排序后的行号
+     * @param list<array{output: array<string,mixed>, source: array<string,mixed>}> $entries
+     * @param array<int, mixed> $results
+     */
+    private function computeRanking(WindowExpression $window, array $sorted, array $entries, array &$results): void
+    {
+        $rowNumber = 0;
+        $rank = 1;
+        $denseRank = 1;
+        $prevKey = null;
+
+        foreach ($sorted as $i) {
+            ++$rowNumber;
+            if ($window->function === 'ROW_NUMBER') {
+                $results[$i] = $rowNumber;
+                continue;
+            }
+
+            // RANK / DENSE_RANK：比较排序键（全 null 视为相等，null 语义同 SQL——最小值视为并列）
+            $currentKey = $this->windowSortKey($entries[$i], $window->orderBy);
+            if ($prevKey !== null && $currentKey !== $prevKey) {
+                $rank = $rowNumber;
+                ++$denseRank;
+            }
+            $prevKey = $currentKey;
+            $results[$i] = $window->function === 'RANK' ? $rank : $denseRank;
+        }
+    }
+
+    /**
+     * 聚合窗口函数计算：整分区（无 ORDER BY）或分区内逐行前缀（有 ORDER BY，
+     * 但当前简化：同排序值整组计算后每行相同值——不做 ROWS BETWEEN 帧）
+     *
+     * @param list<int> $sorted 分区内排序后的行号
+     * @param list<array{output: array<string,mixed>, source: array<string,mixed>}> $entries
+     * @param array<int, mixed> $results
+     */
+    private function computeAggregateWindow(WindowExpression $window, array $sorted, array $entries, array &$results): void
+    {
+        // COUNT(*)：统计分区行数（含 null）
+        if ($window->column === '*' && $window->function === 'COUNT') {
+            $single = count($sorted);
+            foreach ($sorted as $i) {
+                $results[$i] = $single;
+            }
+
+            return;
+        }
+
+        // 收集全分区非 null 值
+        $values = [];
+        foreach ($sorted as $i) {
+            $value = $this->resolveColumn($entries[$i]['source'], $window->column);
+            if ($value !== null) {
+                $values[] = $value;
+            }
+        }
+
+        $single = $this->aggregateWindowValue($window->function, $values);
+
+        // 每行写入相同值（当前简化：不做 ROWS BETWEEN 帧）
+        foreach ($sorted as $i) {
+            $results[$i] = $single;
+        }
+    }
+
+    /**
+     * 排序键序列化（分区排序键比较用）
+     *
+     * @param list<array{column: string, direction: 'ASC'|'DESC'}> $orderBy
+     */
+    private function windowSortKey(array $entry, array $orderBy): string
+    {
+        $parts = [];
+        foreach ($orderBy as $order) {
+            $parts[] = $this->resolveColumn($entry['source'], $order['column']);
+        }
+
+        return json_encode($parts, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+    }
+
+    /**
+     * 聚合窗口单值：COUNT/SUM/AVG/MIN/MAX 对值列表统一计算（与 aggregateValue 逻辑一致）
+     *
+     * @param list<mixed> $values 非 null 值列表
+     */
+    private function aggregateWindowValue(string $function, array $values): mixed
+    {
+        if ($function === 'COUNT') {
+            return count($values);
+        }
+        if ($values === []) {
+            return null;
+        }
+        if ($function === 'MIN' || $function === 'MAX') {
+            $allNumeric = true;
+            foreach ($values as $value) {
+                if (!$this->isNumericValue($value)) {
+                    $allNumeric = false;
+                    break;
+                }
+            }
+            $best = $values[0];
+            for ($i = 1, $c = count($values); $i < $c; $i++) {
+                $cmp = $allNumeric
+                    ? ValueCaster::compareNumeric($values[$i], $best)
+                    : (string) $values[$i] <=> (string) $best;
+                if (($function === 'MIN' && $cmp < 0) || ($function === 'MAX' && $cmp > 0)) {
+                    $best = $values[$i];
+                }
+            }
+
+            return $best;
+        }
+
+        // SUM / AVG
+        $sum = 0;
+        foreach ($values as $value) {
+            if (!$this->isNumericValue($value)) {
+                throw new QueryException("聚合窗口 {$function} 含非数值值: " . var_export($value, true));
+            }
+            $sum += $value;
+        }
+
+        return $function === 'AVG' ? $sum / count($values) : $sum;
+    }
+
+    private static function resolveSortValue(array $entry, string $column, array $outputKeys): mixed
+    {
+        if (in_array($column, $outputKeys, true)) {
+            return $entry['output'][$column] ?? null;
+        }
+
+        return $entry['source'][$column] ?? null;
+    }
 
     /**
      * 收尾三段：DISTINCT → ORDER BY → LIMIT/OFFSET（builder 已校验非负）
@@ -830,7 +1233,8 @@ final class Executor
 
     /**
      * 多列稳定排序：先看输出行键（精确或去限定名匹配），否则回退源限定行（含歧义检查）；
-     * 排序列命中 collations 时字符串值折叠后比较（null 语义不变）
+     * 排序列命中 collations 时字符串值折叠后比较（null 语义不变）；
+     * 大结果集（> EXTERNAL_SORT_CHUNK_ROWS）自动走外部归并——写临时文件分块 + 多路归并
      *
      * @param list<array{output: array<string,mixed>, source: array<string,mixed>}> $entries
      * @param list<array{column: string, direction: 'ASC'|'DESC'}> $orderBy
@@ -839,34 +1243,37 @@ final class Executor
      */
     private function sort(array $entries, array $orderBy, array $collations): array
     {
-        // 预解析：每条排序规格尝试匹配输出键，未匹配则回退源行解析，并解析 collation
-        $outputKeys = $entries === [] ? [] : array_keys($entries[0]['output']);
-        $specs = [];
-        foreach ($orderBy as $order) {
-            $outputKey = null;
-            if (in_array($order['column'], $outputKeys, true)) {
-                $outputKey = $order['column'];
-            } else {
-                $short = $this->shortName($order['column']);
-                if (in_array($short, $outputKeys, true)) {
-                    $outputKey = $short;
-                }
-            }
-            $specs[] = [
-                'column' => $order['column'],
-                'direction' => $order['direction'],
-                'outputKey' => $outputKey,
-                'ci' => ConditionEvaluator::resolveCI($collations, $order['column']),
-            ];
+        if ($entries === []) {
+            return [];
         }
 
-        // 稳定排序：usort 前标记原始索引
-        $decorated = [];
-        foreach ($entries as $index => $entry) {
-            $decorated[] = ['index' => $index, 'entry' => $entry];
+        // 预解析排序规格
+        $outputKeys = array_keys($entries[0]['output']);
+        $specs = self::resolveSortSpecs($orderBy, $outputKeys, $collations);
+
+        // 外部归并阈值
+        if (count($entries) > self::EXTERNAL_SORT_CHUNK_ROWS) {
+            return $this->externalSort($entries, $specs);
         }
 
-        usort($decorated, function (array $a, array $b) use ($specs): int {
+        return $this->memorySort($entries, $specs);
+    }
+
+    /**
+     * 内存排序（usort 稳定排序，保留原始索引）
+     *
+     * @param list<array{output: array<string,mixed>, source: array<string,mixed>}> $entries
+     * @param list<array> $specs
+     * @return list<array{output: array<string,mixed>, source: array<string,mixed>}>
+     */
+    private function memorySort(array $entries, array $specs): array
+    {
+        $indexed = [];
+        foreach ($entries as $i => $entry) {
+            $indexed[] = ['index' => $i, 'entry' => $entry];
+        }
+
+        usort($indexed, function (array $a, array $b) use ($specs): int {
             foreach ($specs as $spec) {
                 $cmp = $this->compare(
                     $this->sortValue($a['entry'], $spec),
@@ -881,7 +1288,176 @@ final class Executor
             return $a['index'] <=> $b['index'];
         });
 
-        return array_map(static fn (array $item): array => $item['entry'], $decorated);
+        return array_map(static fn (array $item): array => $item['entry'], $indexed);
+    }
+
+    /**
+     * 外部归并排序：超阈值时写临时文件分块后多路归并
+     *
+     * @param list<array{output: array<string,mixed>, source: array<string,mixed>}> $entries
+     * @param list<array> $specs
+     * @return list<array{output: array<string,mixed>, source: array<string,mixed>}>
+     */
+    private function externalSort(array $entries, array $specs): array
+    {
+        $tempDir = sys_get_temp_dir() . '/psql-sort-' . uniqid();
+        if (!mkdir($tempDir, 0700) && !is_dir($tempDir)) {
+            // 退化为内存排序
+            return $this->memorySort($entries, $specs);
+        }
+
+        try {
+            $chunks = [];
+            $chunk = [];
+            foreach ($entries as $entry) {
+                $chunk[] = $entry;
+                if (count($chunk) >= self::EXTERNAL_SORT_CHUNK_ROWS) {
+                    $chunks[] = $this->writeSortedChunk($tempDir, $chunk, $specs, count($chunks));
+                    $chunk = [];
+                }
+            }
+            if ($chunk !== []) {
+                $chunks[] = $this->writeSortedChunk($tempDir, $chunk, $specs, count($chunks));
+            }
+
+            return $this->mergeChunks($chunks, $specs);
+        } finally {
+            $this->cleanTempDir($tempDir);
+        }
+    }
+
+    /**
+     * 写排序分块到临时文件（内存排序后 serialize）
+     *
+     * @param list<array{output: array<string,mixed>, source: array<string,mixed>}> $chunk
+     * @param list<array> $specs
+     * @return string 临时文件路径
+     */
+    private function writeSortedChunk(string $tempDir, array $chunk, array $specs, int $index): string
+    {
+        $sorted = $this->memorySort($chunk, $specs);
+        $path = $tempDir . '/' . $index . '.sort';
+        file_put_contents($path, serialize($sorted), LOCK_EX);
+
+        return $path;
+    }
+
+    /**
+     * 多路归并：从各分块文件逐一读取，用最小堆按规格排序合并
+     *
+     * @param list<string> $chunkFiles
+     * @param list<array> $specs
+     * @return list<array{output: array<string,mixed>, source: array<string,mixed>}>
+     */
+    private function mergeChunks(array $chunkFiles, array $specs): array
+    {
+        /** @var list<list<array{output: array<string,mixed>, source: array<string,mixed>}>> 每个分块已加载的行缓冲 */
+        $buffers = [];
+        /** @var list<int> 每个分块的当前读取偏移 */
+        $offsets = array_fill(0, count($chunkFiles), 0);
+
+        // 加载所有分块到内存（每个分块已 ≤ EXTERNAL_SORT_CHUNK_ROWS 行，内存可接受）
+        foreach ($chunkFiles as $path) {
+            $data = unserialize(file_get_contents($path));
+            $buffers[] = is_array($data) ? $data : [];
+        }
+
+        $result = [];
+        while (true) {
+            // 找当前最小（按排序规格比较）
+            $best = null;
+            $bestIdx = -1;
+            $bestEntry = null;
+            foreach ($buffers as $i => $buf) {
+                if ($offsets[$i] < count($buf)) {
+                    $entry = $buf[$offsets[$i]];
+                    if ($best === null || $this->compareEntries($entry, $bestEntry, $specs) < 0) {
+                        $best = $entry;
+                        $bestIdx = $i;
+                        $bestEntry = $entry;
+                    }
+                }
+            }
+            if ($bestIdx === -1) {
+                break;
+            }
+            $result[] = $best;
+            $offsets[$bestIdx]++;
+        }
+
+        return $result;
+    }
+
+    /**
+     * 两条目按排序规格比较（稳定：同值时先出者优先，由分块内序 + 扫描序保证）
+     */
+    private function compareEntries(
+        array $a,
+        array $b,
+        array $specs,
+    ): int {
+        foreach ($specs as $spec) {
+            $cmp = $this->compare(
+                $this->sortValue($a, $spec),
+                $this->sortValue($b, $spec),
+                $spec['ci'],
+            );
+            if ($cmp !== 0) {
+                return $spec['direction'] === 'DESC' ? -$cmp : $cmp;
+            }
+        }
+
+        return 0;
+    }
+
+    /**
+     * 清理临时目录
+     */
+    private function cleanTempDir(string $dir): void
+    {
+        if (!is_dir($dir)) {
+            return;
+        }
+        foreach (scandir($dir) as $item) {
+            if ($item === '.' || $item === '..') {
+                continue;
+            }
+            @unlink($dir . '/' . $item);
+        }
+        @rmdir($dir);
+    }
+
+    /**
+     * 解析排序规格（公共逻辑，内存/外部归并共用）
+     *
+     * @param list<array{column: string, direction: 'ASC'|'DESC'}> $orderBy
+     * @param list<string> $outputKeys
+     * @param array<string, true> $collations
+     * @return list<array{column: string, direction: string, outputKey: ?string, ci: bool}>
+     */
+    private static function resolveSortSpecs(array $orderBy, array $outputKeys, array $collations): array
+    {
+        $specs = [];
+        foreach ($orderBy as $order) {
+            $outputKey = null;
+            if (in_array($order['column'], $outputKeys, true)) {
+                $outputKey = $order['column'];
+            } else {
+                $pos = strrpos($order['column'], '.');
+                $short = $pos === false ? $order['column'] : substr($order['column'], $pos + 1);
+                if (in_array($short, $outputKeys, true)) {
+                    $outputKey = $short;
+                }
+            }
+            $specs[] = [
+                'column' => $order['column'],
+                'direction' => $order['direction'],
+                'outputKey' => $outputKey,
+                'ci' => ConditionEvaluator::resolveCI($collations, $order['column']),
+            ];
+        }
+
+        return $specs;
     }
 
     /**
@@ -915,7 +1491,7 @@ final class Executor
             return 1;
         }
         if ($this->isNumericValue($left) && $this->isNumericValue($right)) {
-            return (float) $left <=> (float) $right;
+            return ValueCaster::compareNumeric($left, $right);
         }
         if ($ci) {
             return (string) $this->ciFoldValue($left) <=> (string) $this->ciFoldValue($right);
@@ -970,7 +1546,7 @@ final class Executor
     /**
      * 基于源结构解析列名到限定键（空表也可校验）；'a.col' 精确，'col' 唯一匹配
      *
-     * @param list<array{alias: string, schema: TableSchema}> $sources
+     * @param list<array{alias: string, table: ?string, columns: list<string>, ci: array<string, true>, schema: ?TableSchema, rows?: list<array<string,mixed>>}> $sources
      */
     private function resolveKeyName(array $sources, string $column): string
     {
@@ -979,7 +1555,7 @@ final class Executor
             $alias = substr($column, 0, $pos);
             $name = substr($column, $pos + 1);
             foreach ($sources as $source) {
-                if ($source['alias'] === $alias && $source['schema']->hasColumn($name)) {
+                if ($source['alias'] === $alias && in_array($name, $source['columns'], true)) {
                     return $column;
                 }
             }
@@ -989,7 +1565,7 @@ final class Executor
 
         $candidates = [];
         foreach ($sources as $source) {
-            if ($source['schema']->hasColumn($column)) {
+            if (in_array($column, $source['columns'], true)) {
                 $candidates[] = $source['alias'] . '.' . $column;
             }
         }

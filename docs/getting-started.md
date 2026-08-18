@@ -8,11 +8,16 @@ use Kingbes\Psql\Psql;
 // 1. 文件持久化连接：数据落在磁盘，重开后仍在
 $db = Psql::connect('/data/appdb');
 
+// 单 writer 多 reader 并发 / WAL 崩溃恢复（可选，可组合）
+// $db = Psql::connect('/data/appdb', ['concurrency' => true]);
+// $db = Psql::connect('/data/appdb', ['wal' => true, 'concurrency' => true]);
+
 // 2. 纯内存连接：适合缓存、测试、临时数据
 $db = Psql::memory();
 ```
 
 - `connect(path)`：目录不存在会自动创建；路径不可写、磁盘 IO 失败抛 `StorageException`
+- `connect(path, options)`：`concurrency`（单 writer 多 reader 并发）与 `wal`（WAL 崩溃恢复）可选开启，详见[事务文档](transactions.md#并发与崩溃恢复v22--v23)
 - `memory()`：数据只存在于当前 PHP 进程，进程结束即消失
 
 文件引擎的磁盘布局为 `<path>/<数据库>/<表>.json`，每个 JSON 文件包含表结构（schema）、自增计数（auto_increment）与全部行数据（rows），写入采用"临时文件 + rename"原子替换，损坏的文件在读取时抛 `StorageException`。

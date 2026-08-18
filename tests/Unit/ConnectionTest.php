@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Kingbes\Psql\Tests\Unit;
 
+use InvalidArgumentException;
 use Kingbes\Psql\Connection;
 use Kingbes\Psql\Exception\QueryException;
 use Kingbes\Psql\Exception\SchemaException;
@@ -53,6 +54,33 @@ final class ConnectionTest extends TestCase
         $this->assertSame('main', $connection->currentDatabase());
         $this->assertTrue($connection->hasDatabase('main'));
         $this->assertContains('main', $connection->databases());
+    }
+
+    public function testConnectWithCustomEngineOption(): void
+    {
+        $engine = new MemoryEngine();
+
+        $connection = Psql::connect('/ignored-path', ['engine' => $engine]);
+
+        $this->assertSame($engine, $connection->engine());
+        $this->assertSame('main', $connection->currentDatabase());
+        $this->assertTrue($connection->hasDatabase('main'));
+    }
+
+    public function testConnectWithEngineAndCodecOptionsThrows(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('互斥');
+
+        Psql::connect('/ignored-path', ['engine' => new MemoryEngine(), 'compress' => true]);
+    }
+
+    public function testConnectWithNonEngineValueThrows(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('StorageEngine');
+
+        Psql::connect('/ignored-path', ['engine' => 'not-an-engine']);
     }
 
     public function testUseSwitchesDatabaseAndThrowsWhenMissing(): void

@@ -24,6 +24,10 @@ enum DataType: string
     case DATE = 'DATE';
     case DATETIME = 'DATETIME';
     case TIMESTAMP = 'TIMESTAMP';
+    case JSON = 'JSON';
+    case BLOB = 'BLOB';
+    case BINARY = 'BINARY';
+    case SET = 'SET';
 
     /**
      * 是否整型（四种）
@@ -37,12 +41,12 @@ enum DataType: string
     }
 
     /**
-     * 是否字符串类型（CHAR/VARCHAR/TEXT）
+     * 是否字符串类型（CHAR/VARCHAR/TEXT/BINARY/SET）
      */
     public function isString(): bool
     {
         return match ($this) {
-            self::CHAR, self::VARCHAR, self::TEXT => true,
+            self::CHAR, self::VARCHAR, self::TEXT, self::BINARY, self::SET => true,
             default => false,
         };
     }

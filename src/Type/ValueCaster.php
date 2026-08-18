@@ -39,8 +39,12 @@ final class ValueCaster
             DataType::BOOLEAN => self::castBoolean($value, $column),
             DataType::CHAR,
             DataType::VARCHAR => self::castString($value, $column, true),
-            DataType::TEXT => self::castString($value, $column, false),
+            DataType::TEXT,
+            DataType::BLOB => self::castString($value, $column, false),
+            DataType::BINARY => self::castBinary($value, $column),
+            DataType::JSON => self::castJson($value, $column),
             DataType::ENUM => self::castEnum($value, $column),
+            DataType::SET => self::castSet($value, $column),
             DataType::DATE => self::castDate($value, $column),
             DataType::DATETIME,
             DataType::TIMESTAMP => self::castDateTime($value, $column),
@@ -50,10 +54,17 @@ final class ValueCaster
     // ---- 整型 ----
 
     /**
-     * 整型转换：bool→0/1；int 直接；float 仅整数值；纯数字字符串；随后范围校验
+     * 整型转换：bool→0/1；int 直接；float 仅整数值；纯数字字符串；随后范围校验。
+     * UNSIGNED BIGINT 超 PHP_INT_MAX 的值以十进制字符串表示（bcmath 校验范围）
+     *
+     * @return int|string
      */
-    private static function castInteger(mixed $value, ColumnSchema $column): int
+    private static function castInteger(mixed $value, ColumnSchema $column): int|string
     {
+        if ($column->type === DataType::BIGINT && $column->unsigned) {
+            return self::castUnsignedBigInt($value, $column);
+        }
+
         $int = self::coerceInteger($value, $column);
         [$min, $max] = self::integerRange($column);
         if ($int < $min || $int > $max) {
@@ -61,6 +72,130 @@ final class ValueCaster
         }
 
         return $int;
+    }
+
+    /**
+     * UNSIGNED BIGINT：范围 [0, 2^64-1]；值 ≤ PHP_INT_MAX 仍为 int，
+     * 超 PHP_INT_MAX 以十进制字符串存储（float 已丢精度，超大数须以字符串传入）
+     *
+     * @return int|string
+     */
+    private static function castUnsignedBigInt(mixed $value, ColumnSchema $column): int|string
+    {
+        $max = '18446744073709551615';
+        $maxInt = '9223372036854775807';
+
+        if (is_bool($value)) {
+            return $value ? 1 : 0;
+        }
+        if (is_int($value)) {
+            if ($value < 0) {
+                throw new TypeException(self::fail($column, "unsigned 列不接受负数: {$value}"));
+            }
+
+            return $value;
+        }
+        if (is_float($value)) {
+            if (fmod($value, 1.0) !== 0.0 || $value < 0) {
+                throw new TypeException(self::fail($column, "非负整数值 {$value} 不能转换为 UNSIGNED BIGINT"));
+            }
+            if ($value > (float) PHP_INT_MAX) {
+                throw new TypeException(
+                    self::fail($column, "float 无法精确表示超大整数 {$value}，请使用十进制字符串传入")
+                );
+            }
+
+            return (int) $value;
+        }
+        if (is_string($value) && preg_match(self::NUMERIC_PATTERN, $value) === 1) {
+            if (str_contains($value, '.')) {
+                throw new TypeException(self::fail($column, "UNSIGNED BIGINT 不接受小数: {$value}"));
+            }
+            $negative = str_starts_with(ltrim($value, ' '), '-');
+            if ($negative) {
+                throw new TypeException(self::fail($column, "unsigned 列不接受负数: {$value}"));
+            }
+
+            $digits = self::normalizeIntegerString($value);
+            if ($digits === '0') {
+                return 0;
+            }
+            // ≤ PHP_INT_MAX → int；否则精确比较是否 ≤ 2^64-1
+            if (strlen($digits) < 19 || (strlen($digits) === 19 && $digits <= $maxInt)) {
+                return (int) $digits;
+            }
+            if (self::compareIntegerStrings($digits, $max) > 0) {
+                throw new TypeException(self::fail($column, "值 {$value} 超出 UNSIGNED BIGINT 范围 [0, {$max}]"));
+            }
+
+            return $digits;
+        }
+
+        throw new TypeException(self::fail($column, '无法转换为 UNSIGNED BIGINT: ' . self::describe($value)));
+    }
+
+    /**
+     * 精确数值比较：双侧均为十进制整数字符串时按整数精确比较（bcmath 优先），
+     * 否则回退 (float) 比较。供条件/排序/聚合/索引归一跨模块复用
+     */
+    public static function compareNumeric(mixed $left, mixed $right): int
+    {
+        if (self::isLargeIntegerString($left) || self::isLargeIntegerString($right)) {
+            return self::compareIntegerStrings((string) $left, (string) $right);
+        }
+
+        return (float) $left <=> (float) $right;
+    }
+
+    /**
+     * 是否超过 float 精确范围的十进制整数字符串（位数 >= 16，含符号）
+     */
+    public static function isLargeIntegerString(mixed $value): bool
+    {
+        if (!is_string($value)) {
+            return false;
+        }
+
+        return preg_match('/^[+-]?\d+$/', $value) === 1 && strlen(ltrim($value, '+-')) >= 16;
+    }
+
+    /**
+     * 十进制整数字符串精确比较（可含正负号与前导零）；无 bcmath 时按符号+长度+字典序退化
+     */
+    public static function compareIntegerStrings(string $a, string $b): int
+    {
+        if (function_exists('bccomp')) {
+            return bccomp($a, $b);
+        }
+
+        $an = self::absDigits($a);
+        $bn = self::absDigits($b);
+        $aneg = str_starts_with(ltrim($a, ' '), '-');
+        $bneg = str_starts_with(ltrim($b, ' '), '-');
+        if ($aneg !== $bneg) {
+            return $aneg ? -1 : 1;
+        }
+        $cmp = (strlen($an) <=> strlen($bn)) ?: ($an <=> $bn);
+
+        return $aneg ? -$cmp : $cmp;
+    }
+
+    /**
+     * 十进制整数字符串规范化：去正负号与前导零，返回纯数字（'0' 归一为 '0'）
+     */
+    public static function normalizeIntegerString(string $value): string
+    {
+        $digits = ltrim(ltrim($value, '+-0'), '0');
+
+        return $digits === '' ? '0' : $digits;
+    }
+
+    /**
+     * 取整数字符串的绝对值数字（去符号与前导零，空为 '0'）
+     */
+    private static function absDigits(string $value): string
+    {
+        return self::normalizeIntegerString($value);
     }
 
     /**
@@ -306,6 +441,93 @@ final class ValueCaster
         }
 
         return $string;
+    }
+
+    // ---- 二进制 / JSON / SET ----
+
+    /**
+     * BINARY(N)：按字节长度校验（不做 \0 填充，文档化限制；与 CHAR 空格填充缺失一致）
+     */
+    private static function castBinary(mixed $value, ColumnSchema $column): string
+    {
+        $string = self::castString($value, $column, false);
+        if ($column->length !== null && strlen($string) > $column->length) {
+            throw new TypeException(
+                self::fail($column, "字节长度 " . strlen($string) . " 超过上限 {$column->length}")
+            );
+        }
+
+        return $string;
+    }
+
+    /**
+     * JSON：数组/标量原样存储（校验可 JSON 编码），JSON 字符串解码后存储；
+     * 解码失败抛 TypeException（JSON 列禁止存非 JSON 文本）
+     */
+    private static function castJson(mixed $value, ColumnSchema $column): mixed
+    {
+        if (is_array($value)) {
+            if (json_encode($value, JSON_UNESCAPED_UNICODE) === false) {
+                throw new TypeException(self::fail($column, '数组无法 JSON 编码: ' . json_last_error_msg()));
+            }
+
+            return $value;
+        }
+        if (is_string($value)) {
+            $decoded = json_decode($value, true);
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                throw new TypeException(self::fail($column, '非法的 JSON 字符串: ' . json_last_error_msg()));
+            }
+
+            return $decoded;
+        }
+        if (is_int($value) || is_float($value) || is_bool($value)) {
+            return $value;
+        }
+
+        throw new TypeException(self::fail($column, '无法转换为 JSON: ' . self::describe($value)));
+    }
+
+    /**
+     * SET：逗号分隔字符串或成员数组；每项必须是合法成员，去重保持首见顺序；
+     * 空数组/空串表示空集（存 ''）
+     */
+    private static function castSet(mixed $value, ColumnSchema $column): string
+    {
+        $members = $column->enumValues;
+        if ($members === null) {
+            throw new TypeException(self::fail($column, '缺少 SET 成员定义'));
+        }
+        if ($value === '') {
+            return '';
+        }
+        if (is_array($value)) {
+            $items = array_values($value);
+            if ($items === []) {
+                return '';
+            }
+        } elseif (is_string($value)) {
+            $items = explode(',', $value);
+        } else {
+            throw new TypeException(self::fail($column, 'SET 值必须为数组或逗号分隔字符串: ' . self::describe($value)));
+        }
+
+        foreach ($items as $item) {
+            if (!is_string($item) || !in_array($item, $members, true)) {
+                throw new TypeException(
+                    self::fail($column, "值 " . var_export($item, true) . " 不是合法 SET 成员")
+                );
+            }
+        }
+
+        $unique = [];
+        foreach ($items as $item) {
+            if (!in_array($item, $unique, true)) {
+                $unique[] = $item;
+            }
+        }
+
+        return implode(',', $unique);
     }
 
     // ---- 时间 ----

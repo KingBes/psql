@@ -9,6 +9,8 @@ use Kingbes\Psql\Exception\ConstraintException;
 use Kingbes\Psql\Exception\QueryException;
 use Kingbes\Psql\Query\Condition\Condition;
 use Kingbes\Psql\Query\ConditionEvaluator;
+use Kingbes\Psql\Query\JoinClause;
+use Kingbes\Psql\Query\SelectQuery;
 use Kingbes\Psql\Result\InsertResult;
 use Kingbes\Psql\Schema\ColumnSchema;
 use Kingbes\Psql\Schema\ForeignKey;
@@ -49,15 +51,16 @@ final class Writer
         $aiName = $aiColumn?->name;
         $currentAi = $engine->autoIncrement($db, $table);
 
-        // 唯一元组池（现存行）与自增已用值池（现存行 + 本批次）
+        // 唯一元组池（现存行）与自增已用值池（现存行 + 本批次；键用 int 与下方 (int) 归一一致）
         $tuples = [];
+        /** @var array<int, true> $usedAi */
         $usedAi = [];
         foreach ($existing as $row) {
             foreach ($this->uniqueEntries($schema, $row) as $entry) {
                 $tuples[$entry['tuple']] = true;
             }
             if ($aiName !== null && isset($row[$aiName])) {
-                $usedAi[(string) $row[$aiName]] = true;
+                $usedAi[(int) $row[$aiName]] = true;
             }
         }
 
@@ -76,11 +79,11 @@ final class Writer
                 if ($value === null) {
                     do {
                         ++$nextAi;
-                    } while (isset($usedAi[(string) $nextAi]));
+                    } while (isset($usedAi[$nextAi]));
                     $value = $nextAi;
                     $newRow[$aiName] = $value;
                 }
-                $usedAi[(string) $value] = true;
+                $usedAi[(int) $value] = true;
                 $maxUsedAi = max($maxUsedAi, (int) $value);
             }
 
@@ -342,10 +345,13 @@ final class Writer
      * 按条件更新，返回受影响（matched）行数；
      * 被引用列变化时按引用方外键的 onUpdate 策略分发（RESTRICT/CASCADE/SET_NULL/SET_DEFAULT）；
      * 携带 orderBy/limit 时为 MySQL UPDATE ... ORDER BY ... LIMIT 语义（matched 排序后取前 limit 行更新，
-     * 无排序规格则按存储序截取；limit 0 合法返回 0）
+     * 无排序规格则按存储序截取；limit 0 合法返回 0）；
+     * $joins 非空时为多表 UPDATE（MySQL 语义）：JOIN + WHERE 定位匹配行，SET 中每个目标表
+     * （'alias.col' 限定键；裸键归基表）逐表走完整更新管线；不支持 ORDER BY/LIMIT（MySQL 同款，构建器拦截）
      *
      * @param array<string,mixed> $values
      * @param list<array{column: string, direction: 'ASC'|'DESC'}>|null $orderBy
+     * @param list<JoinClause> $joins
      */
     public function update(
         string $table,
@@ -354,7 +360,12 @@ final class Writer
         array $values,
         ?array $orderBy = null,
         ?int $limit = null,
+        array $joins = [],
     ): int {
+        if ($joins !== []) {
+            return $this->updateJoined($table, $alias, $where, $values, $joins);
+        }
+
         $db = $this->connection->currentDatabase();
         $engine = $this->connection->engine();
         $schema = $engine->loadSchema($db, $table);
@@ -424,6 +435,32 @@ final class Writer
             $newRows[$index] = $newRow;
         }
 
+        $this->applyUpdateRows($db, $table, $schema, $rows, $matched, $newRows, $casted);
+
+        return count($matched);
+    }
+
+    /**
+     * 对指定表应用更新（单表与多表路径共用）：唯一/FK 存在性/CHECK 校验 + 触发器 +
+     * 被引用列变化的 FK onUpdate 传播（RESTRICT/CASCADE/SET_NULL/SET_DEFAULT）+ 落盘
+     *
+     * @param list<array<string,mixed>> $rows 当前表全部行（行号与 $matched 对应）
+     * @param list<int> $matched 待更新行号
+     * @param array<int, array<string,mixed>> $newRows matched 行的新行
+     * @param array<string,mixed> $casted 本次赋值列的 cast 后值（FK 传播与被引用列变化判定用）
+     */
+    private function applyUpdateRows(
+        string $db,
+        string $table,
+        TableSchema $schema,
+        array $rows,
+        array $matched,
+        array $newRows,
+        array $casted,
+    ): void {
+        $engine = $this->connection->engine();
+        $triggers = $this->connection->triggerManager();
+
         // 引用本表且指向本次更新列的外键；被引用列值实际变化时需按 onUpdate 策略处理
         $referencingFks = $this->referencingForeignKeys($db, $table, array_keys($casted));
         $referencedChanged = false;
@@ -465,7 +502,7 @@ final class Writer
                 }
             }
 
-            return count($matched);
+            return;
         }
 
         // RESTRICT：v1 兼容——被引用列值变化即拦截（消息含引用方表名）
@@ -586,8 +623,6 @@ final class Writer
                 $triggers->afterUpdate($table, $rows[$index], $allRows[$table][$index]);
             }
         }
-
-        return count($matched);
     }
 
     // ---- DELETE ----
@@ -596,12 +631,19 @@ final class Writer
      * 按条件删除（BFS 级联），返回初始 matched 行数（级联删除不计入）；
      * 引用方外键按 onDelete 策略分发：RESTRICT 拦截 / CASCADE 级联 / SET_NULL 置空 / SET_DEFAULT 置默认；
      * 携带 orderBy/limit 时为 MySQL DELETE ... ORDER BY ... LIMIT 语义（matched 排序后取前 limit 行删除，
-     * 无排序规格则按存储序截取；limit 0 合法返回 0）
+     * 无排序规格则按存储序截取；limit 0 合法返回 0）；
+     * $joins 非空时为多表 DELETE（MySQL 语义）：JOIN + WHERE 定位匹配行，仅删除基表
+     * （`table()` 的目标表）中匹配的行，join 表只参与匹配；不支持 ORDER BY/LIMIT（MySQL 同款，构建器拦截）
      *
      * @param list<array{column: string, direction: 'ASC'|'DESC'}>|null $orderBy
+     * @param list<JoinClause> $joins
      */
-    public function delete(string $table, ?string $alias, ?Condition $where, ?array $orderBy = null, ?int $limit = null): int
+    public function delete(string $table, ?string $alias, ?Condition $where, ?array $orderBy = null, ?int $limit = null, array $joins = []): int
     {
+        if ($joins !== []) {
+            return $this->deleteJoined($table, $alias, $where, $joins);
+        }
+
         $db = $this->connection->currentDatabase();
         $engine = $this->connection->engine();
         $schema = $engine->loadSchema($db, $table);
@@ -627,6 +669,205 @@ final class Writer
         }
 
         return $this->deleteMatched($db, $table, $schema, $rows, $matched);
+    }
+
+    // ---- 多表 UPDATE / DELETE（JOIN 写入） ----
+
+    /**
+     * 多表 UPDATE（MySQL 语义）：JOIN + WHERE 定位匹配行，SET 中每个目标表
+     * （'alias.col' 限定键；裸键归基表）逐表走 applyUpdateRows 完整管线；
+     * 匹配行按"内容哈希"反查行号（同一物理行多次匹配只更新一次）
+     *
+     * @param array<string,mixed> $values
+     * @param list<JoinClause> $joins
+     */
+    private function updateJoined(string $table, ?string $alias, ?Condition $where, array $values, array $joins): int
+    {
+        $db = $this->connection->currentDatabase();
+        $engine = $this->connection->engine();
+
+        $sources = $this->resolveWriteSources($db, $table, $alias, $joins);
+
+        // SET 键解析与 cast：'alias.col' 限定键 / 裸键归基表；未知别名/列抛 QueryException
+        $assignments = [];
+        foreach ($values as $key => $value) {
+            $key = (string) $key;
+            $pos = strrpos($key, '.');
+            if ($pos === false) {
+                $targetAlias = $alias ?? $table;
+                $col = $key;
+            } else {
+                $targetAlias = substr($key, 0, $pos);
+                $col = substr($key, $pos + 1);
+            }
+            if (!isset($sources[$targetAlias])) {
+                throw new QueryException("未知表别名: {$targetAlias}");
+            }
+            $targetTable = $sources[$targetAlias]['table'];
+            $schema = $engine->loadSchema($db, $targetTable);
+            if (!$schema->hasColumn($col)) {
+                throw new QueryException("未知列: {$targetTable}.{$col}");
+            }
+            $column = $schema->columnOrFail($col);
+            $casted = ValueCaster::cast($value, $column);
+            if (($column->notNull || $column->primaryKey) && $casted === null) {
+                throw new ConstraintException("表 {$targetTable} 列 {$col} 不允许为 NULL");
+            }
+            $assignments[$targetAlias][$col] = $casted;
+        }
+
+        // 匹配行：完整查询（含 JOIN + WHERE 子查询解析）执行到限定行
+        $query = new SelectQuery($table, $alias, [], $joins, $where);
+        $matchedQualified = (new Executor($this->connection))->matchedRows($query);
+
+        // 各源行快照（写路径按内容反查行号；行号在多次写回间保持稳定——writeRows 保序不减行）
+        $rowsByAlias = [];
+        foreach ($sources as $srcAlias => $src) {
+            $rowsByAlias[$srcAlias] = $engine->readRows($db, $src['table']);
+        }
+
+        // 按源别名收集匹配行的内容哈希（列全 null = LEFT/RIGHT 无匹配侧，无真实行，跳过）
+        $matchedHashes = [];
+        foreach ($matchedQualified as $qualified) {
+            foreach ($sources as $srcAlias => $src) {
+                $content = [];
+                $allNull = true;
+                foreach ($src['columns'] as $col) {
+                    $value = $qualified[$srcAlias . '.' . $col] ?? null;
+                    if ($value !== null) {
+                        $allNull = false;
+                    }
+                    $content[$col] = $value;
+                }
+                if (!$allNull) {
+                    $matchedHashes[$srcAlias][self::rowHash($content)] = true;
+                }
+            }
+        }
+
+        // 逐目标表应用更新：全部基于同一份行快照（同一物理行多次匹配只更新一次；跨目标不互相覆盖）
+        $affected = 0;
+        foreach ($assignments as $targetAlias => $casted) {
+            $targetTable = $sources[$targetAlias]['table'];
+            $schema = $engine->loadSchema($db, $targetTable);
+            $rows = $rowsByAlias[$targetAlias];
+            $matched = [];
+            foreach ($rows as $index => $row) {
+                if (isset($matchedHashes[$targetAlias][self::rowHash($row)])) {
+                    $matched[] = $index;
+                }
+            }
+            if ($matched === []) {
+                continue;
+            }
+            $newRows = [];
+            foreach ($matched as $index) {
+                $newRows[$index] = array_merge($rows[$index], $casted);
+            }
+            $this->applyUpdateRows($db, $targetTable, $schema, $rows, $matched, $newRows, $casted);
+            $affected += count($matched);
+        }
+
+        return $affected;
+    }
+
+    /**
+     * 多表 DELETE（MySQL 语义）：JOIN + WHERE 定位匹配行，仅删除基表（`table()` 目标表）
+     * 中匹配的行，join 表只参与匹配；复用 deleteMatched 完整管线（触发器/BFS 级联/RESTRICT/SET_NULL/SET_DEFAULT）
+     *
+     * @param list<JoinClause> $joins
+     */
+    private function deleteJoined(string $table, ?string $alias, ?Condition $where, array $joins): int
+    {
+        $db = $this->connection->currentDatabase();
+        $engine = $this->connection->engine();
+
+        $sources = $this->resolveWriteSources($db, $table, $alias, $joins);
+        $targetAlias = $alias ?? $table;
+        $targetTable = $sources[$targetAlias]['table'];
+        $schema = $engine->loadSchema($db, $targetTable);
+
+        $query = new SelectQuery($table, $alias, [], $joins, $where);
+        $matchedQualified = (new Executor($this->connection))->matchedRows($query);
+
+        $matchedHashes = [];
+        foreach ($matchedQualified as $qualified) {
+            $content = [];
+            $allNull = true;
+            foreach ($sources[$targetAlias]['columns'] as $col) {
+                $value = $qualified[$targetAlias . '.' . $col] ?? null;
+                if ($value !== null) {
+                    $allNull = false;
+                }
+                $content[$col] = $value;
+            }
+            if (!$allNull) {
+                $matchedHashes[self::rowHash($content)] = true;
+            }
+        }
+
+        $rows = $engine->readRows($db, $targetTable);
+        $matched = [];
+        foreach ($rows as $index => $row) {
+            if (isset($matchedHashes[self::rowHash($row)])) {
+                $matched[] = $index;
+            }
+        }
+
+        if ($matched === []) {
+            return 0;
+        }
+
+        return $this->deleteMatched($db, $targetTable, $schema, $rows, $matched);
+    }
+
+    /**
+     * 写入源解析：基表 + 各 join 表 → [alias => ['table' =>, 'columns' =>]]
+     * 别名 = 显式别名 ?: 表名（与 Executor 的 appendSource 一致）；重复别名抛 QueryException
+     *
+     * @param list<JoinClause> $joins
+     * @return array<string, array{table: string, columns: list<string>}>
+     */
+    private function resolveWriteSources(string $db, string $table, ?string $alias, array $joins): array
+    {
+        $sources = [];
+        $baseAlias = $alias ?? $table;
+        $sources[$baseAlias] = ['table' => $table, 'columns' => $this->tableColumnNames($db, $table)];
+        foreach ($joins as $join) {
+            $joinAlias = $join->alias ?? $join->table;
+            if (isset($sources[$joinAlias])) {
+                throw new QueryException("表别名重复: {$joinAlias}");
+            }
+            $sources[$joinAlias] = ['table' => $join->table, 'columns' => $this->tableColumnNames($db, $join->table)];
+        }
+
+        return $sources;
+    }
+
+    /**
+     * 表列名列表（按结构序）
+     *
+     * @return list<string>
+     */
+    private function tableColumnNames(string $db, string $table): array
+    {
+        $names = [];
+        foreach ($this->connection->engine()->loadSchema($db, $table)->columns as $column) {
+            $names[] = $column->name;
+        }
+
+        return $names;
+    }
+
+    /**
+     * 行内容哈希（键序不敏感），多表写路径按内容反查行号用；
+     * BLOB 等二进制值用 UTF-8 替换字符归一（确定性，同内容恒同哈希）
+     */
+    private static function rowHash(array $row): string
+    {
+        ksort($row);
+
+        return json_encode($row, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
     }
 
     /**

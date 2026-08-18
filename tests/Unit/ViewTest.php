@@ -360,19 +360,54 @@ final class ViewTest extends TestCase
 
     // ---- 基表删除 / 表 DDL 对视图名拦截 ----
 
-    public function testViewOnDroppedBaseTableThrows(): void
+    public function testDropTableReferencedByViewThrows(): void
     {
         $connection = Psql::memory();
         $this->createUsers($connection);
         $connection->createView('adults', $connection->table('users')->where('age', '>=', 18));
 
-        // v1 简化：dropTable 不联动删除视图，执行时报未知表（既有行为）
-        $connection->dropTable('users');
-
+        // 拒绝删除被视图引用的基表（MySQL 语义），表与视图均保留
+        try {
+            $connection->dropTable('users');
+            $this->fail('删除被视图引用的基表未抛异常');
+        } catch (SchemaException $e) {
+            $this->assertStringContainsString('users', $e->getMessage());
+            $this->assertStringContainsString('adults', $e->getMessage());
+        }
+        $this->assertTrue($connection->hasTable('users'));
         $this->assertTrue($connection->hasView('adults'));
-        $this->expectException(QueryException::class);
-        $this->expectExceptionMessage('表不存在');
-        $connection->view('adults')->get();
+
+        // 删除视图后即可删除基表
+        $connection->dropView('adults');
+        $connection->dropTable('users');
+        $this->assertFalse($connection->hasTable('users'));
+    }
+
+    public function testRenameTableReferencedByViewThrows(): void
+    {
+        $connection = Psql::memory();
+        $this->createUsers($connection);
+        $connection->createView('adults', $connection->table('users')->where('age', '>=', 18));
+
+        // 拒绝重命名被视图引用的基表（MySQL 语义）
+        try {
+            $connection->renameTable('users', 'members');
+            $this->fail('重命名被视图引用的基表未抛异常');
+        } catch (SchemaException $e) {
+            $this->assertStringContainsString('users', $e->getMessage());
+            $this->assertStringContainsString('adults', $e->getMessage());
+        }
+        $this->assertTrue($connection->hasTable('users'));
+        $this->assertFalse($connection->hasTable('members'));
+
+        // 视图不引用该表时重命名照常
+        $connection->createTable('free', static function (Blueprint $table): void {
+            $table->id();
+            $table->varchar('note', 20);
+        });
+        $connection->renameTable('free', 'freed');
+        $this->assertFalse($connection->hasTable('free'));
+        $this->assertTrue($connection->hasTable('freed'));
     }
 
     public function testCreateIndexOnViewNameThrows(): void

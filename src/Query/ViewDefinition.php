@@ -73,6 +73,42 @@ final readonly class ViewDefinition
     }
 
     /**
+     * 视图是否直接或间接引用指定表（基表 / join 表 / 嵌套子查询与 union 递归）
+     *
+     * 供 DDL 联动校验：dropTable/renameTable 拒绝破坏被视图引用的基表
+     */
+    public function usesTable(string $table): bool
+    {
+        return self::queryUsesTable($this->toQuery(), $table);
+    }
+
+    /**
+     * SelectQuery 递归检测表引用
+     */
+    private static function queryUsesTable(SelectQuery $query, string $table): bool
+    {
+        if ($query->fromSub !== null) {
+            if (self::queryUsesTable($query->fromSub, $table)) {
+                return true;
+            }
+        } elseif ($query->table === $table) {
+            return true;
+        }
+        foreach ($query->joins as $join) {
+            if ($join->table === $table) {
+                return true;
+            }
+        }
+        foreach ($query->unions as $union) {
+            if (self::queryUsesTable($union->query, $table)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
      * SelectQuery → 结构化数组：逐字段展开，joins 元素与 unions 递归展开
      *
      * @return array<string, mixed>
@@ -81,6 +117,12 @@ final readonly class ViewDefinition
     {
         if ($query->expressions !== []) {
             throw new QueryException('视图定义包含不可持久化的投影表达式（函数/CASE）');
+        }
+        if ($query->windows !== []) {
+            throw new QueryException('视图定义包含不可持久化的窗口函数');
+        }
+        if ($query->fromSub !== null) {
+            throw new QueryException('视图定义包含不可持久化的 FROM 子查询（派生表）');
         }
 
         $where = null;
@@ -104,21 +146,29 @@ final readonly class ViewDefinition
             ];
         }
 
-        return [
-            'table' => $query->table,
-            'alias' => $query->alias,
-            'columns' => $query->columns,
-            'joins' => array_map(
-                static fn (JoinClause $join): array => [
+        $joins = [];
+        foreach ($query->joins as $join) {
+            try {
+                $joins[] = [
                     'type' => $join->type,
                     'table' => $join->table,
                     'alias' => $join->alias,
                     'left_column' => $join->leftColumn,
                     'operator' => $join->operator,
                     'right_column' => $join->rightColumn,
-                ],
-                $query->joins,
-            ),
+                    'on' => $join->on?->toArray(),
+                ];
+            } catch (StorageException) {
+                // 列-列比较（ColumnRef 值）不可序列化，拒绝持久化
+                throw new QueryException('视图定义包含不可持久化的 ON 条件（列-列比较）');
+            }
+        }
+
+        return [
+            'table' => $query->table,
+            'alias' => $query->alias,
+            'columns' => $query->columns,
+            'joins' => $joins,
             'where' => $where,
             'aggregates' => array_map(
                 static fn (AggregateExpression $aggregate): array => [
@@ -192,9 +242,10 @@ final readonly class ViewDefinition
                 self::stringField($join, 'type'),
                 self::stringField($join, 'table'),
                 $join['alias'] ?? null,
-                self::stringField($join, 'left_column'),
-                self::stringField($join, 'operator'),
-                self::stringField($join, 'right_column'),
+                $join['left_column'] ?? '',
+                $join['operator'] ?? '',
+                $join['right_column'] ?? '',
+                isset($join['on']) && is_array($join['on']) ? Condition::fromArray($join['on']) : null,
             );
         }
 

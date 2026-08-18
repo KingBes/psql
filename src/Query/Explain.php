@@ -9,6 +9,7 @@ use Kingbes\Psql\Query\Condition\Comparison;
 use Kingbes\Psql\Query\Condition\Condition;
 use Kingbes\Psql\Query\Condition\ConditionGroup;
 use Kingbes\Psql\Query\Condition\ExistsCheck;
+use Kingbes\Psql\Query\Condition\ScalarSubquery;
 use Kingbes\Psql\Query\Condition\SubqueryIn;
 use Kingbes\Psql\Schema\TableSchema;
 
@@ -29,48 +30,88 @@ final class Explain
         $db = $connection->currentDatabase();
         $engine = $connection->engine();
 
-        // 基表 schema（表不存在时透传底层异常）
-        $baseSchema = $engine->loadSchema($db, $query->table);
-
         $steps = [];
 
-        // 1) 基表访问路径：索引预过滤判定（镜像 Executor 触发条件）；
-        //    估算行数为实际存储行数（EXPLAIN 允许读取存储数据但不执行查询本体）
-        $estRows = count($engine->readRows($db, $query->table));
-        $indexColumns = self::candidateIndexColumns($connection, $query, $baseSchema);
-        if ($indexColumns !== null) {
-            $name = self::indexName($baseSchema, $indexColumns);
+        // 1) 基表访问路径：物理表评估索引预过滤（镜像 Executor 触发条件），估算行数为实际存储行数；
+        //    派生表（FROM 子查询）无静态结构，输出 DERIVED 步骤（不评估内部计划）
+        if ($query->fromSub !== null) {
             $steps[] = [
-                'step' => 'SCAN',
+                'step' => 'DERIVED',
                 'table' => $query->table,
-                'via' => "INDEX {$name} (hash, equality)",
-                'estRows' => $estRows,
-                'detail' => '哈希索引等值预过滤，候选行仍完整求值原 WHERE 兜底；'
-                    . '估算行数为实际存储行数，索引预过滤后另行求值（哈希索引无基数统计）',
+                'detail' => 'FROM 为子查询（派生表），作为独立查询完整执行后按输出列进入常规流水线'
+                    . '（计划不含子查询内部步骤，索引/扫描判定不适用）',
             ];
         } else {
-            $steps[] = [
-                'step' => 'SCAN',
-                'table' => $query->table,
-                'via' => 'FULL SCAN',
-                'estRows' => $estRows,
-                'detail' => '全表扫描读取全部存储行',
-            ];
+            $baseSchema = $engine->loadSchema($db, $query->table);
+            $estRows = count($engine->readRows($db, $query->table));
+            $indexColumns = self::candidateIndexColumns($connection, $query, $baseSchema);
+            if ($indexColumns !== null) {
+                $name = self::indexName($baseSchema, $indexColumns);
+                $steps[] = [
+                    'step' => 'SCAN',
+                    'table' => $query->table,
+                    'via' => "INDEX {$name} (hash, equality)",
+                    'estRows' => $estRows,
+                    'detail' => '哈希索引等值预过滤，候选行仍完整求值原 WHERE 兜底；'
+                        . '估算行数为实际存储行数，索引预过滤后另行求值（哈希索引无基数统计）',
+                ];
+            } else {
+                $steps[] = [
+                    'step' => 'SCAN',
+                    'table' => $query->table,
+                    'via' => 'FULL SCAN',
+                    'estRows' => $estRows,
+                    'detail' => '全表扫描读取全部存储行',
+                ];
+            }
         }
 
         // 2) JOIN：按声明顺序逐个分派（镜像 Executor::applyJoin 的 hash/nested 条件）
-        $sources = [[
-            'table' => $query->table,
-            'alias' => $query->alias ?? $query->table,
-            'schema' => $baseSchema,
-        ]];
+        $sources = $query->fromSub !== null
+            ? [['table' => $query->table, 'alias' => $query->alias ?? $query->table, 'schema' => null]]
+            : [['table' => $query->table, 'alias' => $query->alias ?? $query->table, 'schema' => $baseSchema]];
         foreach ($query->joins as $join) {
+            // CTE 连接源：无静态结构，输出 DERIVED 式步骤（执行期独立完整执行后按输出列参与连接）
+            if ($join->cte !== null) {
+                $on = $join->on !== null
+                    ? 'condition expression'
+                    : $join->leftColumn . ' ' . $join->operator . ' ' . $join->rightColumn;
+                $steps[] = [
+                    'step' => 'JOIN',
+                    'type' => 'DERIVED',
+                    'right' => $join->cte,
+                    'on' => $on,
+                    'detail' => '连接源为 WITH CTE（非物化，独立完整执行后按输出列参与连接；无索引/结构元数据）',
+                ];
+                $sources[] = [
+                    'table' => $join->cte,
+                    'alias' => $join->alias ?? $join->table,
+                    'schema' => null,
+                ];
+
+                continue;
+            }
+
             $joinSchema = $engine->loadSchema($db, $join->table);
             $joinSource = [
                 'table' => $join->table,
                 'alias' => $join->alias ?? $join->table,
                 'schema' => $joinSchema,
             ];
+
+            // 任意 ON 条件表达式：无法静态判定访问路径，恒为嵌套循环逐行求值
+            if ($join->on !== null) {
+                $steps[] = [
+                    'step' => 'JOIN',
+                    'type' => 'NESTED LOOP',
+                    'right' => $join->table,
+                    'on' => 'condition expression',
+                    'detail' => 'ON 为任意条件表达式，在合并行上按条件组求值（无法静态优化，恒走嵌套循环）',
+                ];
+                $sources[] = $joinSource;
+
+                continue;
+            }
 
             $leftCI = self::columnIsCI($sources, $join->leftColumn);
             $rightCI = self::columnIsCI([$joinSource], $join->rightColumn);
@@ -121,6 +162,21 @@ final class Explain
                     $query->aggregates,
                 ),
                 'detail' => '内存分组聚合',
+            ];
+        }
+
+        // 4.5) 窗口函数（投影/聚合后整组计算，再进入收尾）
+        foreach ($query->windows as $window) {
+            $steps[] = [
+                'step' => 'WINDOW',
+                'func' => $window->function,
+                'partitionBy' => $window->partitionBy,
+                'orderBy' => implode(', ', array_map(
+                    static fn (array $o): string => $o['column'] . ' ' . $o['direction'],
+                    $window->orderBy,
+                )),
+                'detail' => '按 PARTITION BY 分组、ORDER BY 排序后整组计算窗口值，写入输出列'
+                    . ($window->alias() !== null ? "（别名 {$window->alias()}）" : ''),
             ];
         }
 
@@ -279,9 +335,10 @@ final class Explain
 
     /**
      * 列在给定源集中是否 CI：与 Executor::columnIsCI 保持同步（镜像实现）——
-     * 限定名仅查对应别名源；裸名任一源命中 CI 列即视为 CI（保守回退）
+     * 限定名仅查对应别名源；裸名任一源命中 CI 列即视为 CI（保守回退）；
+     * 派生表源（schema 为 null）无 CI 声明，视为区分大小写
      *
-     * @param list<array{table: string, alias: string, schema: TableSchema}> $sources
+     * @param list<array{table: string, alias: string, schema: ?TableSchema}> $sources
      */
     private static function columnIsCI(array $sources, string $column): bool
     {
@@ -291,6 +348,9 @@ final class Explain
             $name = substr($column, $pos + 1);
             foreach ($sources as $source) {
                 if ($source['alias'] === $alias) {
+                    if ($source['schema'] === null) {
+                        return false;
+                    }
                     foreach ($source['schema']->columns as $schemaColumn) {
                         if ($schemaColumn->name === $name) {
                             return $schemaColumn->ci;
@@ -305,6 +365,9 @@ final class Explain
         }
 
         foreach ($sources as $source) {
+            if ($source['schema'] === null) {
+                continue;
+            }
             foreach ($source['schema']->columns as $schemaColumn) {
                 if ($schemaColumn->name === $column && $schemaColumn->ci) {
                     return true;
@@ -318,7 +381,7 @@ final class Explain
     /**
      * 解析列所属源的基础表名（剥别名）：限定名按别名匹配、裸名按列定义命中，未命中回退最近累积源
      *
-     * @param list<array{table: string, alias: string, schema: TableSchema}> $sources
+     * @param list<array{table: string, alias: string, schema: ?TableSchema}> $sources
      */
     private static function resolveSourceTable(array $sources, string $column): string
     {
@@ -336,6 +399,9 @@ final class Explain
             }
         } else {
             foreach ($sources as $source) {
+                if ($source['schema'] === null) {
+                    continue;
+                }
                 foreach ($source['schema']->columns as $schemaColumn) {
                     if ($schemaColumn->name === $column) {
                         return $source['table'];
@@ -362,11 +428,11 @@ final class Explain
     }
 
     /**
-     * 条件树遍历计数：ConditionGroup 递归展开，SubqueryIn/ExistsCheck 各计 1
+     * 条件树遍历计数：ConditionGroup 递归展开，SubqueryIn/ExistsCheck/ScalarSubquery 各计 1
      */
     private static function countInCondition(Condition $condition): int
     {
-        if ($condition instanceof SubqueryIn || $condition instanceof ExistsCheck) {
+        if ($condition instanceof SubqueryIn || $condition instanceof ExistsCheck || $condition instanceof ScalarSubquery) {
             return 1;
         }
         if ($condition instanceof ConditionGroup) {

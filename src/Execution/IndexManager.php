@@ -6,6 +6,7 @@ namespace Kingbes\Psql\Execution;
 
 use Kingbes\Psql\Connection;
 use Kingbes\Psql\Schema\ColumnSchema;
+use Kingbes\Psql\Type\ValueCaster;
 
 /**
  * 索引管理器：基于 writeVersion 的连接级哈希索引缓存，
@@ -112,8 +113,8 @@ final class IndexManager
 
     /**
      * 键规范化：与 ConditionEvaluator::compare 的等值语义对齐——
-     * 数值性（int/float/bool/纯数字字符串）按 (float) 强转归一（'5'、5、'5.0'、5.0 合一，
-     * 超大整数/浮点字符串亦按 float 精度归一，与 compareValues 完全一致）；
+     * 数值性（int/float/bool/纯数字字符串）按 (float) 强转归一（'5'、5、'5.0'、5.0 合一）；
+     * 超大整数字符串（float 精度不足）按规范化十进制字符串归一（避免不同大数在 float 精度下撞键）；
      * 其余按 (string) 强转归一
      */
     public static function normalizeKey(mixed $value): string
@@ -125,6 +126,10 @@ final class IndexManager
             return 'n:' . var_export((float) $value, true);
         }
         if (is_string($value) && preg_match(self::NUMERIC_PATTERN, $value) === 1) {
+            if (ValueCaster::isLargeIntegerString($value)) {
+                return 'n:' . ValueCaster::normalizeIntegerString($value);
+            }
+
             return 'n:' . var_export((float) $value, true);
         }
 

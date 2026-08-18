@@ -95,6 +95,56 @@ class Blueprint
     }
 
     /**
+     * 二进制大对象（不限长度）
+     */
+    public function blob(string $name): ColumnDefinition
+    {
+        return $this->addColumn($name, DataType::BLOB);
+    }
+
+    /**
+     * 定长二进制，长度 1..255（不做 \0 填充，文档化限制）
+     */
+    public function binary(string $name, int $length): ColumnDefinition
+    {
+        if ($length < 1 || $length > 255) {
+            throw new SchemaException("BINARY 长度须在 1..255 之间，当前: {$length}");
+        }
+
+        return $this->addColumn($name, DataType::BINARY, length: $length);
+    }
+
+    /**
+     * JSON 列（存储为可 JSON 编码的 PHP 值）
+     */
+    public function json(string $name): ColumnDefinition
+    {
+        return $this->addColumn($name, DataType::JSON);
+    }
+
+    /**
+     * 多值字符串集合，成员非空且唯一；存储为逗号分隔字符串
+     *
+     * @param list<string> $values
+     */
+    public function set(string $name, array $values): ColumnDefinition
+    {
+        if ($values === []) {
+            throw new SchemaException("SET 列 {$name} 的成员列表不能为空");
+        }
+        foreach ($values as $value) {
+            if (!is_string($value)) {
+                throw new SchemaException("SET 列 {$name} 的成员必须为字符串");
+            }
+        }
+        if (count(array_unique($values)) !== count($values)) {
+            throw new SchemaException("SET 列 {$name} 的成员必须唯一");
+        }
+
+        return $this->addColumn($name, DataType::SET, enumValues: array_values($values));
+    }
+
+    /**
      * 精确小数，1 <= scale <= precision <= 65
      */
     public function decimal(string $name, int $precision, int $scale): ColumnDefinition

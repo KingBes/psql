@@ -11,13 +11,24 @@ final readonly class ColumnRef implements ProjectionExpression
 {
     /**
      * @param string $column 列名（裸列名或 'alias.col' 限定名）
+     * @param ?string $alias 显式别名（as 设置）
      */
-    public function __construct(public string $column)
-    {
+    public function __construct(
+        public string $column,
+        private ?string $alias = null,
+    ) {
     }
 
     /**
-     * 输出名即列名本身
+     * 返回带别名的新实例（不可变，参照 FuncExpression::as）
+     */
+    public function as(string $alias): self
+    {
+        return new self($this->column, $alias);
+    }
+
+    /**
+     * 输出名即列名本身（无别名时；有别名时投影以别名作输出键）
      */
     public function outputName(): string
     {
@@ -25,11 +36,11 @@ final readonly class ColumnRef implements ProjectionExpression
     }
 
     /**
-     * 列引用不单独支持别名（外层函数/CASE 负责命名）
+     * 显式别名，未设置返回 null
      */
     public function alias(): ?string
     {
-        return null;
+        return $this->alias;
     }
 
     /**

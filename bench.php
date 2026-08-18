@@ -164,8 +164,11 @@ function runEngine(string $class, int $rowCount, int $updates): array
 
 printf("PHP %s | 行数据：8 列混合类型（含中文/decimal/时间串风格）\n\n", PHP_VERSION);
 
-foreach ([10000, 50000] as $rowCount) {
-    $updates = 100;
+// smoke 模式（CI 用）：仅 2000 行、单行更新 20 次，验证脚本可跑通即可，不等全量
+$rowCounts = in_array('--smoke', $argv, true) ? [2000] : [10000, 50000];
+
+foreach ($rowCounts as $rowCount) {
+    $updates = in_array('--smoke', $argv, true) ? 20 : 100;
     printf("=== %s 行 ===\n", number_format($rowCount));
     printf("%-14s %12s %12s %16s %10s\n", '引擎', '批量写入', '冷加载', "单行更新×{$updates}", '文件大小');
     foreach ([JsonFileEngine::class, PhpSerializeEngine::class, PagedJsonEngine::class] as $class) {

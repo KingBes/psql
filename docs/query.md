@@ -23,7 +23,7 @@ $rows = $db->table('user as u')
 
 ## 表达式与函数
 
-`select()` 投影除了列名与 `Agg` 聚合，还接受标量函数表达式与 CASE 表达式（统一实现 `Query\ProjectionExpression` 接口，对源行求值）。
+`select()` 投影除了列名与 `Agg` 聚合，还接受标量函数表达式、CASE 表达式（统一实现 `Query\ProjectionExpression` 接口，对源行求值）与窗口函数（`WindowExpression`，见[窗口函数](#窗口函数over)）。
 
 ### 标量函数（Func）
 
@@ -180,7 +180,67 @@ $db->table('user')->whereNotExists($sub);     // NOT EXISTS (SELECT ...)
 - 支持多层嵌套——子查询里再套子查询
 - UPDATE / DELETE 的 where 同样支持子查询（见[写入文档](write.md)）
 - CHECK 约束条件中**禁止子查询**（注册时抛 `SchemaException`）
-- 不支持相关子查询——引用外层别名的列会按未知列抛 `QueryException`
+
+### 相关子查询（引用外层列）
+
+子查询条件中可用 `whereColumn` 引用**外层**别名列（外层列在子查询自身源之外解析不到即视为外层引用）：
+
+```php
+// 有订单的用户
+$rows = $db->table('users as u')
+    ->whereExists($db->table('orders as o')->whereColumn('o.user_id', '=', 'u.id'))
+    ->select('u.name')
+    ->get();
+
+// 无订单的用户
+$db->table('users as u')
+    ->whereNotExists($db->table('orders as o')->whereColumn('o.user_id', '=', 'u.id'));
+```
+
+- 外层引用以**限定名**书写（`外层别名.列`）；裸列名视为子查询自身列
+- 外层列可在比较的列侧或值侧（值侧直接绑定；列侧自动换侧并翻转运算符，如 `u.id = o.user_id`）
+- 执行语义：对外层**逐行**绑定外层列值为常量后执行子查询（相关 IN / EXISTS）；支持多层嵌套（子查询内部的子查询递归处理）
+- 相关子查询仅 **SELECT 的 WHERE** 支持——UPDATE/DELETE 的 where 含相关子查询抛 `QueryException`
+
+### 标量子查询（WHERE col = (SELECT ...)）
+
+`whereScalar` / `orWhereScalar`：子查询须输出 1 列，取**首行首列值**与列比较；空集 → NULL（`col = NULL` 恒不匹配，行被过滤）：
+
+```php
+// 金额高于全表平均的订单（非相关）
+$db->table('orders as o')
+    ->whereScalar('o.amount', '>', $db->table('orders')->select(Agg::avg('amount')));
+
+// 每个 user 取自己的最大订单额（相关）
+$db->table('orders as o')
+    ->whereScalar('o.amount', '=', $db->table('orders as om')
+        ->whereColumn('om.user_id', '=', 'o.user_id')
+        ->select(Agg::max('om.amount')));
+```
+
+运算符支持 `=  !=  <>  <  <=  >  >=`；子查询输出多列抛 `QueryException`。
+
+## CTE（WITH 非递归命名子查询）
+
+`with()` 注册命名子查询，之后可作 FROM 源或 JOIN 源（后序 CTE 可引用前序，MySQL 同款）：
+
+```php
+$db->with('adult_users', $db->table('user')->where('age', '>=', 18));
+
+// FROM 位引用
+$rows = $db->fromCte('adult_users')->select('id', 'name')->get();
+
+// JOIN 位引用
+$rows = $db->table('user as u')
+    ->joinCte('adult_users', 'u.id', '=', 'adult_users.id')
+    ->select('u.name')
+    ->get();
+```
+
+- `Connection::with(string $name, SelectBuilder $sub)` 注册；`Table::with()` 同样可用
+- `fromCte('名')` / `joinCte` / `leftJoinCte` / `rightJoinCte`（JOIN 位经执行器解析为派生表）
+- 同一 CTE 可多次引用，每次独立完整执行（非物化）；定义可含聚合/排序/UNION
+- 递归 CTE（`WITH RECURSIVE`）暂不支持；CTE 查询不能建视图、不能作多表写入目标（与派生表同约束）
 
 ## 索引加速
 
@@ -232,6 +292,7 @@ $rows = $db->table('student as s')
 
 - JOIN 表同样支持 `'score as sc'` / `'score sc'` 别名
 - ON 条件支持全部比较运算符
+- **自连接**：同一表多次以不同别名 join，用 `Func::col('m.name')->as(...)` 区分输出同名列（如员工-经理）；INNER/LEFT/RIGHT 均支持，别名重复抛 `QueryException`
 - 每个源（基表 + 各 join 表）的列在行内以 `别名.列名` 为键；短列名在多个源中重复时必须用限定名，否则抛 `QueryException`（歧义）
 
 ## GROUP BY / HAVING / 聚合
@@ -248,7 +309,7 @@ $rows = $db->table('student as s')
 
 - 聚合工厂：`Agg::count('col'|'*')`、`Agg::sum/avg/min/max('col')`，`->as('别名')` 设置输出键（无别名时输出键如 `COUNT(*)`、`SUM(salary)`）
 - `having` 按输出别名过滤，引用不存在的别名抛 `QueryException`
-- 空组语义：COUNT → 0；SUM/AVG/MIN/MAX → null
+- 空组语义：COUNT → 0；SUM/AVG/MIN/MAX → null（v2.2 起统一。v2.1 及之前 MIN/MAX 空表抛异常）
 - SUM/AVG 遇非数值（且非纯数字字符串）值抛 `QueryException`
 
 ## ORDER BY / LIMIT / OFFSET / DISTINCT
@@ -284,6 +345,35 @@ $rows = $db->table('student')->select('name', 'age')->where('age', '>=', 18)
 - 各方输出列**键集必须一致**（不一致抛 `QueryException`；某方结果为空时跳过该方校验）
 - 合并后外层的 `distinct()` / `orderBy` / `limit` / `offset` 作用于合并结果
 
+## 窗口函数（OVER）
+
+排名函数与聚合窗口，在投影/聚合之后整组计算（v2.2）：
+
+```php
+use Kingbes\Psql\Query\Func;
+
+// 每个部门内按工资降序排名
+$rows = $db->table('employees as e')
+    ->select('e.name', 'e.dept', 'e.salary',
+        Func::rowNumber()->partitionBy('e.dept')->orderBy('e.salary', 'DESC')->as('rn'))
+    ->orderBy('e.dept')
+    ->orderBy('rn')
+    ->get();
+
+// 聚合窗口：部门工资总额（整分区统计，每行同值）
+use Kingbes\Psql\Query\Agg;
+$rows = $db->table('employees as e')
+    ->select('e.name', 'e.dept', 'e.salary',
+        Agg::sum('e.salary')->over()->partitionBy('e.dept')->as('dept_total'))
+    ->get();
+```
+
+- **排名函数**：`Func::rowNumber()` / `Func::rank()`（并列跳档，1,1,3）/ `Func::denseRank()`（并列不跳档，1,1,2）——须指定 `orderBy`，否则抛 `QueryException`
+- **聚合窗口**：`Agg::count/sum/avg/min/max('col')->over()`（COUNT 支持 `'*'`）——整分区统计，**每行同值**（不做 `ROWS BETWEEN` 帧）
+- 规格链：`->partitionBy('列', ...)` → `->orderBy('列', 'ASC'|'DESC')` / `->orderByDesc('列')` → `->as('别名')`
+- 窗口值写入输出行别名键，可继续 `orderBy('rn')` 等；窗口查询不可持久化为视图（`createView` 拒绝）
+- `explain()` 输出 `WINDOW` 步骤
+
 ## 视图 VIEW
 
 把一个查询固化为命名视图，之后按名取用：
@@ -310,8 +400,8 @@ $db->dropView('adults');              // 不存在抛 SchemaException
 - **持久化**：定义以结构化 JSON 存储——文件引擎存库目录 `.views.json`，Memory 引擎存内存；跨连接重开自动恢复
 - **事务覆盖**：事务快照包含视图目录，事务内建/删视图可随 `rollBack()` 回滚（同 DDL 语义，详见[事务文档](transactions.md)）
 - **限制**：
-  - 视图定义包含**子查询条件**（`whereIn` 子查询等）或**投影表达式**（`Func` / `CaseWhen`）时，`createView()` 抛 `QueryException`（此类定义无法结构化持久化）
-  - `renameTable()` / `dropTable()` **不联动**视图：基表删除后视图定义仍在，但 `view()->get()` 抛"表不存在"
+  - 视图定义包含**子查询条件**（`whereIn` 子查询等）、**投影表达式**（`Func` / `CaseWhen`）或**窗口函数**时，`createView()` 抛 `QueryException`（此类定义无法结构化持久化）
+  - `renameTable()` / `dropTable()` **联动视图**（v2.2）：基表被视图引用时操作抛 `SchemaException`（防止悬空视图）；删除视图后再改基表即可
 
 ## EXPLAIN
 
@@ -342,11 +432,14 @@ $steps = $db->table('user')->where('email', '=', $e)->explain();
 | `SUBQUERY` | 子查询条件（`whereIn` 子查询 / `whereExists` 等）计数 | `count`：先解析为常量列表/真值再进入常规求值 |
 | `UNION` | UNION 分支 | `type`（UNION / UNION ALL）与 `order`，每方独立完整执行后合并 |
 | `AGGREGATE` | 分组聚合 | `groupBy` 分组列、`funcs` 聚合函数列表，内存分组聚合 |
-| `SORT` | 排序 | `keys` 排序键，内存排序（无外部归并） |
+| `WINDOW` | 窗口函数 | `func`（ROW_NUMBER/RANK/DENSE_RANK 或聚合）、`partitionBy`、`orderBy`，投影/聚合后整组计算 |
+| `SORT` | 排序 | `keys` 排序键；大结果集自动外部归并（写临时文件分块 + 多路归并，见下文） |
 | `DISTINCT` | 输出去重 | 内存去重，保持首见顺序 |
 | `LIMIT` | 分页截断 | `limit` / `offset`，排序完成后应用 |
 
-步骤按查询流水线顺序输出（SCAN → JOIN → SUBQUERY → UNION → AGGREGATE → SORT → DISTINCT → LIMIT）。
+步骤按查询流水线顺序输出（SCAN → JOIN → SUBQUERY → UNION → AGGREGATE → WINDOW → SORT → DISTINCT → LIMIT）。
+
+**外部归并**：结果集超过内存阈值（`Executor` 内部估算）时，`orderBy` 自动改走外部归并——排序键抽取后分块写临时文件（磁盘），再多路归并（含淘汰重复排序键优化），完成后清理临时文件；阈值内仍走内存排序，结果一致、对调用方透明。
 
 ### 口径与一致性保证
 
@@ -377,10 +470,10 @@ json_encode($rs);         // 实现 JsonSerializable
 
 ```php
 $db->table('user')->count();          // int（空表 0）
-$db->table('user')->sum('balance');   // float（空集 0.0）
-$db->table('user')->avg('age');       // float（空集 0.0）
-$db->table('user')->min('age');       // mixed（空表抛 QueryException）
-$db->table('user')->max('age');       // mixed（空表抛 QueryException）
+$db->table('user')->sum('balance');   // ?float（空表 null）
+$db->table('user')->avg('age');       // ?float（空表 null）
+$db->table('user')->min('age');       // mixed（空表 null）
+$db->table('user')->max('age');       // mixed（空表 null）
 ```
 
 也可链在条件后：`$db->table('user')->where('vip', 1)->count();`

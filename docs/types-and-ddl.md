@@ -4,16 +4,23 @@
 
 | 类别 | Blueprint 方法 | PHP 存储 | 说明 |
 |---|---|---|---|
-| 整数 | `tinyint` / `smallint` / `int` / `bigint` | int | 越界抛 `TypeException`；UNSIGNED 拒绝负数 |
+| 整数 | `tinyint` / `smallint` / `int` / `bigint` | int | 越界抛 `TypeException`；UNSIGNED 拒绝负数；**UNSIGNED BIGINT 超 `PHP_INT_MAX` 存十进制字符串**（bcmath 精确比较，见下） |
 | 精确小数 | `decimal(name, M, D)` | string | 规范化为恰好 D 位小数的字符串；`1 <= D <= M <= 65` |
 | 浮点 | `float` / `double` | float | |
 | 布尔 | `boolean` | int | 存 0/1；接受 bool/int/"0"/"1" |
 | 定长串 | `char(name, M)` | string | M 1..255；不做空格填充 |
 | 变长串 | `varchar(name, M)` | string | M 1..65535；按字符数计（mb），超长抛异常 |
 | 长文本 | `text` | string | 无长度限制 |
+| 二进制 | `binary(name, M)` / `blob` | string | 原始字节；`binary` 长度 1..255，`blob` 无长度限制 |
+| JSON | `json` | string | 存入前 JSON 校验（合法 JSON 字符串）；读回为字符串（**非反序列化**，需自行 `json_decode`） |
+| 集合 | `set(name, ['a','b'])` | string | 成员非空且唯一；写入值须为单个合法成员 |
 | 枚举 | `enum(name, ['a','b'])` | string | 成员非空且唯一；非法值抛异常 |
 | 日期 | `date` | string | `Y-m-d` 严格校验 |
 | 日期时间 | `datetime` / `timestamp` | string | `Y-m-d H:i:s` 严格校验；支持 `defaultNow()` |
+
+### 超限 BIGINT（bcmath）
+
+`UNSIGNED BIGINT` 超过 `PHP_INT_MAX`（9.22e18）时，值以**十进制字符串**存储（不丢失精度），比较经 bcmath 精确计算（`ValueCaster` 统一处理）；大整数不能参与位运算与算术（会回退为浮点，精度损失），排序/等值/范围比较均精确。小值仍以 int 存储，外部视角不变。
 
 ### 值转换规则（写入时）
 
@@ -198,9 +205,24 @@ $db->alterTable('student', function (\Kingbes\Psql\Schema\AlterBlueprint $t) {
 $db->hasTable('student');       // bool
 $db->tables();                  // list<string>
 $db->renameTable('a', 'b');     // 结构与数据同步迁移；b 已存在抛异常
-$db->dropTable('student');      // 被外键引用时抛 SchemaException
+$db->dropTable('student');      // 被外键引用时抛 SchemaException；被视图引用同样拦截（v2.2）
 $db->table('student')->truncate();  // 清空数据、保留结构、自增归零
 ```
+
+## 迁移工具（schema diff，v2.2）
+
+对比两个连接的库结构，生成可预览/可应用的 alter 计划（`Kingbes\Psql\Schema\Migration`）：
+
+```php
+use Kingbes\Psql\Schema\Migration;
+
+$plan = Migration::diff($target, $current);   // 把 $current 迁为 $target 的步骤列表（不执行）
+Migration::apply($current, $plan);            // 顺序执行：建表 → 改表 → 删表
+```
+
+- 覆盖：建表/删表、加列/删列/改列、索引增删；列改 NOT NULL 且无默认值自动降级为 `note`（无法自动回填，需手工）
+- 联合唯一/外键/CHECK 差异输出 `note` 提示（AlterBlueprint 不支持增删这些约束）
+- `modifyColumn` 为 drop + add，该列既有数据会丢失（步骤带 `warning` 标记）
 
 ## 命名规则
 

@@ -2,4 +2,5 @@ vendor/
 .vscode
 .trae
 *.cache
+.phpstan-cache/
 composer.lock

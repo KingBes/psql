@@ -14,6 +14,7 @@ use Kingbes\Psql\Query\Condition\ExistsCheck;
 use Kingbes\Psql\Query\Condition\InList;
 use Kingbes\Psql\Query\Condition\LikeCondition;
 use Kingbes\Psql\Query\Condition\NullCheck;
+use Kingbes\Psql\Query\Condition\ScalarSubquery;
 use Kingbes\Psql\Query\Condition\SubqueryIn;
 
 /**
@@ -53,7 +54,7 @@ final class ConditionEvaluator
             // 解析后的常量真值（EXISTS 化简产物）
             return $condition->value;
         }
-        if ($condition instanceof SubqueryIn || $condition instanceof ExistsCheck) {
+        if ($condition instanceof SubqueryIn || $condition instanceof ExistsCheck || $condition instanceof ScalarSubquery) {
             // 原始子查询条件禁止直接求值（必须先经 SubqueryResolver 解析，绝不静默求值）
             throw new QueryException('子查询条件必须先经 SubqueryResolver 解析');
         }
@@ -144,18 +145,22 @@ final class ConditionEvaluator
     }
 
     /**
-     * 比较条件：任一侧为 null 视为未知（false）；列 CI 时字符串侧折叠后比较
+     * 比较条件：任一侧为 null 视为未知（false）；列 CI 时字符串侧折叠后比较；
+     * 值可为 ProjectionExpression（列引用），在行上求值
      *
      * @param array<string, true>|null $collations
      */
     private static function evaluateComparison(array $row, Comparison $condition, ?array $collations = null): bool
     {
         $value = self::resolveValue($row, $condition->column);
-        if ($value === null || $condition->value === null) {
+        $right = $condition->value instanceof ProjectionExpression
+            ? $condition->value->evaluate($row)
+            : $condition->value;
+        if ($value === null || $right === null) {
             return false;
         }
 
-        $cmp = self::compare($value, $condition->value, self::resolveCI($collations, $condition->column));
+        $cmp = self::compare($value, $right, self::resolveCI($collations, $condition->column));
 
         return match ($condition->operator) {
             '=' => $cmp === 0,
@@ -285,12 +290,13 @@ final class ConditionEvaluator
 
     /**
      * 比较规则：双侧均为数值性按数值比较（ci 不影响数值性判定），否则按字符串比较；
-     * ci=true 时字符串侧先折叠（仅 is_string 值），非字符串值原样强转比较
+     * ci=true 时字符串侧先折叠（仅 is_string 值），非字符串值原样强转比较；
+     * 超大整数字符串（float 精度不足）走 ValueCaster::compareNumeric 精确比较
      */
     private static function compare(mixed $left, mixed $right, bool $ci = false): int
     {
         if (self::isNumeric($left) && self::isNumeric($right)) {
-            return (float) $left <=> (float) $right;
+            return \Kingbes\Psql\Type\ValueCaster::compareNumeric($left, $right);
         }
         if ($ci) {
             return (string) self::ciFold($left) <=> (string) self::ciFold($right);

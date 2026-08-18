@@ -63,8 +63,37 @@ $db->releaseSavepoint('sp1');    // 释放保存点（不改数据）；外层�
 - 保存点快照同样覆盖 DDL 与视图目录——事务内建/删表、建/删视图均可部分回滚
 - `rollBackTo` 后索引缓存自动失效重建
 
-## 限制（v1 文档化）
+## 并发与崩溃恢复（v2.2 / v2.3）
 
-- **单进程模型**：无并发控制、无锁、无隔离级别配置——psql 运行在单个 PHP 进程内，同一数据目录不应被多个进程同时打开
+默认（无选项）仍是**单进程独占**模型。需要多进程访问或崩溃恢复时，用连接选项开启：
+
+### 单 writer 多 reader（v2.2）
+
+```php
+$db = Psql::connect('/data/appdb', ['concurrency' => true]);
+```
+
+- 操作级读写锁（`Storage\DirectoryLock` + `LockingEngine` 装饰器）：读共享 `LOCK_SH`（多进程并存）、写排他 `LOCK_EX`（互斥）
+- **事务全程持写锁**：`begin()` 起阻塞等待当前 reader 释放，`commit()` / `rollBack()` 释放——事务对并发 reader 原子可见
+- 跨进程缓存失效：`<root>/.wv` 写版本，读前校验变化即清空进程内缓存（长驻 reader 能看到 writer 的新写入）
+- SELECT 经 `readLocked` 整语句持共享锁（语句级一致性）
+- 访问同一库目录的进程应**一致**使用本选项（或一致用默认独占模式），避免混用
+- 仍无隔离级别配置与多 writer 写写冲突检测（见下"限制"）
+
+### WAL / 崩溃恢复（v2.3）
+
+```php
+$db = Psql::connect('/data/appdb', ['wal' => true]);                       // 崩溃恢复
+$db = Psql::connect('/data/appdb', ['wal' => true, 'concurrency' => true]); // 两者组合
+```
+
+- `begin()` 把事务前全引擎快照**原子写入** `<root>/undo.snap`；事务内写照常落盘
+- 进程崩溃（未 commit）后重新打开：自动检测 `undo.snap` → 恢复引擎到事务前状态并落盘 → 清理
+- `commit()` / `rollBack()` 正常清理 `undo.snap`；`wal.log` 记录事务生命周期（供崩溃诊断）
+- **进程级恢复**：PHP 无可靠 fsync，断电级（OS 缓存丢失）不保证；已提交事务写穿即落盘无需重放
+
+## 限制
+
+- **隔离级别 / MVCC**：快照模型提供可重复读语义（单连接内），但无隔离级别配置；多 writer 写写冲突检测未实现（并发模式预期单 writer）
 - **不支持嵌套事务**：重复 `begin()` 抛 `TransactionException`；提交/回滚后可立即开启新事务
 - 事务与连接绑定：`use()` 切换数据库不影响事务范围（快照覆盖所有库）

@@ -23,6 +23,30 @@ final class Func
         return new ColumnRef($column);
     }
 
+    /**
+     * 窗口函数工厂：ROW_NUMBER() OVER (...)
+     */
+    public static function rowNumber(): WindowExpression
+    {
+        return WindowExpression::rowNumber();
+    }
+
+    /**
+     * 窗口函数工厂：RANK() OVER (...)
+     */
+    public static function rank(): WindowExpression
+    {
+        return WindowExpression::rank();
+    }
+
+    /**
+     * 窗口函数工厂：DENSE_RANK() OVER (...)
+     */
+    public static function denseRank(): WindowExpression
+    {
+        return WindowExpression::denseRank();
+    }
+
     public static function upper(string|int|float|bool|null|ProjectionExpression $arg): FuncExpression
     {
         return new FuncExpression('UPPER', [$arg]);

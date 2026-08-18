@@ -8,6 +8,7 @@ use Kingbes\Psql\Connection;
 use Kingbes\Psql\Exception\QueryException;
 use Kingbes\Psql\Execution\Executor;
 use Kingbes\Psql\Execution\Writer;
+use Kingbes\Psql\Query\Condition\ConditionGroup;
 use Kingbes\Psql\Result\InsertResult;
 use Kingbes\Psql\Result\ResultSet;
 
@@ -22,7 +23,7 @@ final class Table
      * 构造期校验表名/别名合法性（Connection 负责解析 'user as u' 后传入）
      */
     public function __construct(
-        private ?Connection $connection,
+        private Connection $connection,
         private string $name,
         private ?string $alias = null,
     ) {
@@ -34,9 +35,62 @@ final class Table
         }
     }
 
-    public function select(string|AggregateExpression|ProjectionExpression ...$columns): SelectBuilder
+    public function select(string|AggregateExpression|ProjectionExpression|WindowExpression ...$columns): SelectBuilder
     {
         return $this->builder()->select(...$columns);
+    }
+
+    public function join(string $table, string $leftColumn, string $operator, string $rightColumn): SelectBuilder
+    {
+        return $this->builder()->join($table, $leftColumn, $operator, $rightColumn);
+    }
+
+    public function leftJoin(string $table, string $leftColumn, string $operator, string $rightColumn): SelectBuilder
+    {
+        return $this->builder()->leftJoin($table, $leftColumn, $operator, $rightColumn);
+    }
+
+    public function rightJoin(string $table, string $leftColumn, string $operator, string $rightColumn): SelectBuilder
+    {
+        return $this->builder()->rightJoin($table, $leftColumn, $operator, $rightColumn);
+    }
+
+    /**
+     * 在当前查询上注册 WITH CTE（JOIN 位用 joinCte 系列引用）
+     */
+    public function with(array $ctes): SelectBuilder
+    {
+        return $this->builder()->with($ctes);
+    }
+
+    public function joinOn(string $table, ConditionGroup $on): SelectBuilder
+    {
+        return $this->builder()->joinOn($table, $on);
+    }
+
+    public function leftJoinOn(string $table, ConditionGroup $on): SelectBuilder
+    {
+        return $this->builder()->leftJoinOn($table, $on);
+    }
+
+    public function rightJoinOn(string $table, ConditionGroup $on): SelectBuilder
+    {
+        return $this->builder()->rightJoinOn($table, $on);
+    }
+
+    public function joinUsing(string $table, string|array $columns): SelectBuilder
+    {
+        return $this->builder()->joinUsing($table, $columns);
+    }
+
+    public function leftJoinUsing(string $table, string|array $columns): SelectBuilder
+    {
+        return $this->builder()->leftJoinUsing($table, $columns);
+    }
+
+    public function rightJoinUsing(string $table, string|array $columns): SelectBuilder
+    {
+        return $this->builder()->rightJoinUsing($table, $columns);
     }
 
     /**
@@ -73,7 +127,7 @@ final class Table
      */
     public function find(mixed $primaryKey): ?array
     {
-        $connection = $this->requireConnection();
+        $connection = $this->connection;
         $schema = $connection->engine()->loadSchema($connection->currentDatabase(), $this->name);
         $primaryColumn = $schema->primaryKey();
         if ($primaryColumn === null) {
@@ -88,7 +142,7 @@ final class Table
      */
     public function insert(array $row): InsertResult
     {
-        return (new Writer($this->requireConnection()))->insert($this->name, $this->alias, [$row]);
+        return (new Writer($this->connection))->insert($this->name, $this->alias, [$row]);
     }
 
     /**
@@ -96,7 +150,7 @@ final class Table
      */
     public function insertMany(array $rows): InsertResult
     {
-        return (new Writer($this->requireConnection()))->insert($this->name, $this->alias, $rows);
+        return (new Writer($this->connection))->insert($this->name, $this->alias, $rows);
     }
 
     /**
@@ -104,7 +158,7 @@ final class Table
      */
     public function upsert(array $row): int
     {
-        return (new Writer($this->requireConnection()))->upsert($this->name, $this->alias, $row);
+        return (new Writer($this->connection))->upsert($this->name, $this->alias, $row);
     }
 
     /**
@@ -112,7 +166,7 @@ final class Table
      */
     public function insertIgnore(array $row): int
     {
-        return (new Writer($this->requireConnection()))->insertIgnore($this->name, $this->alias, $row);
+        return (new Writer($this->connection))->insertIgnore($this->name, $this->alias, $row);
     }
 
     /**
@@ -124,7 +178,7 @@ final class Table
      */
     public function insertSelect(SelectBuilder $source): int
     {
-        $connection = $this->requireConnection();
+        $connection = $this->connection;
         $query = $source->toQuery();
         $this->assertInsertSelectNoSelfReference($query);
 
@@ -160,7 +214,7 @@ final class Table
      */
     public function replace(array $row): int
     {
-        return (new Writer($this->requireConnection()))->replace($this->name, $this->alias, $row);
+        return (new Writer($this->connection))->replace($this->name, $this->alias, $row);
     }
 
     /**
@@ -170,7 +224,7 @@ final class Table
      */
     public function replaceMany(array $rows): int
     {
-        return (new Writer($this->requireConnection()))->replaceMany($this->name, $this->alias, $rows);
+        return (new Writer($this->connection))->replaceMany($this->name, $this->alias, $rows);
     }
 
     /**
@@ -178,7 +232,7 @@ final class Table
      */
     public function update(array $values): int
     {
-        return (new Writer($this->requireConnection()))->update($this->name, $this->alias, null, $values);
+        return (new Writer($this->connection))->update($this->name, $this->alias, null, $values);
     }
 
     /**
@@ -186,12 +240,12 @@ final class Table
      */
     public function delete(): int
     {
-        return (new Writer($this->requireConnection()))->delete($this->name, $this->alias, null);
+        return (new Writer($this->connection))->delete($this->name, $this->alias, null);
     }
 
     public function truncate(): void
     {
-        (new Writer($this->requireConnection()))->truncate($this->name);
+        (new Writer($this->connection))->truncate($this->name);
     }
 
     // ---- 聚合快捷（委托构建器） ----
@@ -233,6 +287,30 @@ final class Table
         return $this->builder()->andWhere($column, ...$args);
     }
 
+    /**
+     * 列-列比较条件（AND 语义）
+     */
+    public function whereColumn(string $left, string $operator, string $right): SelectBuilder
+    {
+        return $this->builder()->whereColumn($left, $operator, $right);
+    }
+
+    /**
+     * 标量子查询条件（AND 语义）：列 运算符 (子查询)
+     */
+    public function whereScalar(string $column, string $operator, SelectBuilder $sub): SelectBuilder
+    {
+        return $this->builder()->whereScalar($column, $operator, $sub);
+    }
+
+    /**
+     * 标量子查询条件（OR 语义）
+     */
+    public function orWhereScalar(string $column, string $operator, SelectBuilder $sub): SelectBuilder
+    {
+        return $this->builder()->orWhereScalar($column, $operator, $sub);
+    }
+
     public function orWhere(string $column, mixed ...$args): SelectBuilder
     {
         return $this->builder()->orWhere($column, ...$args);
@@ -268,6 +346,16 @@ final class Table
     public function whereNotExists(SelectBuilder $sub): SelectBuilder
     {
         return $this->builder()->whereNotExists($sub);
+    }
+
+    public function orWhereExists(SelectBuilder $sub): SelectBuilder
+    {
+        return $this->builder()->orWhereExists($sub);
+    }
+
+    public function orWhereNotExists(SelectBuilder $sub): SelectBuilder
+    {
+        return $this->builder()->orWhereNotExists($sub);
     }
 
     public function whereBetween(string $column, mixed $min, mixed $max): SelectBuilder
@@ -359,12 +447,4 @@ final class Table
         return new SelectBuilder($this->connection, $this->name, $this->alias);
     }
 
-    private function requireConnection(): Connection
-    {
-        if ($this->connection === null) {
-            throw new QueryException('未提供数据库连接实例，无法执行该操作');
-        }
-
-        return $this->connection;
     }
-}

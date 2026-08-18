@@ -36,6 +36,14 @@ final readonly class AggregateExpression
     }
 
     /**
+     * 升级为聚合窗口函数（Agg::sum('x')->over()）：返回 WindowExpression，可链 partitionBy/orderBy
+     */
+    public function over(): WindowExpression
+    {
+        return WindowExpression::fromAggregate($this);
+    }
+
+    /**
      * 输出键：有别名取别名，否则取规范形式（如 COUNT(*)）
      */
     public function outputName(): string

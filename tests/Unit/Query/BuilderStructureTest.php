@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Kingbes\Psql\Tests\Unit\Query;
 
 use Kingbes\Psql\Exception\QueryException;
+use Kingbes\Psql\Psql;
 use Kingbes\Psql\Query\AggregateExpression;
 use Kingbes\Psql\Query\Condition\Between;
 use Kingbes\Psql\Query\Condition\Comparison;
@@ -27,7 +28,7 @@ final class BuilderStructureTest extends TestCase
 {
     private function builder(): SelectBuilder
     {
-        return new SelectBuilder(null, 'users', 'u');
+        return new SelectBuilder(Psql::memory(), 'users', 'u');
     }
 
     public function testFreshBuilderDefaults(): void
@@ -297,33 +298,33 @@ final class BuilderStructureTest extends TestCase
     {
         $this->expectException(QueryException::class);
 
-        new Table(null, 'bad-name');
+        new Table(Psql::memory(), 'bad-name');
     }
 
     public function testTableRejectsNameStartingWithDigit(): void
     {
         $this->expectException(QueryException::class);
 
-        new Table(null, '1users');
+        new Table(Psql::memory(), '1users');
     }
 
     public function testTableRejectsInvalidAlias(): void
     {
         $this->expectException(QueryException::class);
 
-        new Table(null, 'users', 'u!');
+        new Table(Psql::memory(), 'users', 'u!');
     }
 
     public function testTableAcceptsValidNameAndAlias(): void
     {
-        $table = new Table(null, '_tmp1', 't1');
+        $table = new Table(Psql::memory(), '_tmp1', 't1');
 
         $this->assertInstanceOf(Table::class, $table);
     }
 
     public function testTableDelegationBuildsQuery(): void
     {
-        $table = new Table(null, 'users', 'u');
+        $table = new Table(Psql::memory(), 'users', 'u');
 
         $query = $table->select('id')
             ->where('id', 1)

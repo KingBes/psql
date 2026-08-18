@@ -185,6 +185,43 @@ $t->foreignKey('student_id')->references('student', 'id')
 - 支持 `orderBy` + `limit` 排序限量删除（"最新的 100 条"等场景，见 [UPDATE 排序与限量](#排序与限量order-by--limit)）
 - 列声明 `ci()` 时 where 匹配同样折叠大小写（见[类型文档](types-and-ddl.md#collation列级-ci)）
 
+## 多表 UPDATE / DELETE（JOIN 写入）
+
+`update()` / `delete()` 链上先 join 即可限定匹配行，一次操作多表（v2.2，MySQL 语义）：
+
+```php
+// 把 2024 年有订单的用户的 vip 置 1（UPDATE 匹配行限定 + 基表更新）
+$affected = $db->table('user as u')
+    ->join('order as o', 'o.user_id', '=', 'u.id')
+    ->where('o.year', '=', 2024)
+    ->update(['u.vip' => 1]);
+
+// 同时更新多表：SET 键 '别名.列' 限定目标表，裸键归基表
+$affected = $db->table('user as u')
+    ->join('profile as p', 'p.user_id', '=', 'u.id')
+    ->update(['u.vip' => 1, 'p.note' => 'vip']);
+
+// DELETE：仅删基表匹配行，join 表只参与匹配
+$affected = $db->table('user as u')
+    ->leftJoin('order as o', 'o.user_id', '=', 'u.id')
+    ->whereNull('o.id')                       // LEFT JOIN + IS NULL → 无订单的用户
+    ->delete();
+
+// 自连接写入
+$affected = $db->table('employee as e')
+    ->join('employee as m', 'm.id', '=', 'e.manager_id')
+    ->where('m.level', '>', 3)
+    ->update(['e.bonus' => 1]);
+```
+
+- **匹配行定位**：基表 + JOIN + WHERE 完整限定；同一匹配行只生效一次（重复匹配按内容哈希去重）
+- **UPDATE 的 SET 键**：`'别名.列'` 限定目标表，裸键归基表；可同时更新多表
+- **DELETE 只删基表**：join 表仅参与匹配，不删除（MySQL `DELETE t1 FROM` 单目标语义）
+- JOIN 支持 INNER/LEFT/RIGHT、ON 条件组、USING、CTE/派生表源
+- 唯一/外键/CHECK/触发器/onUpdate 传播全部照常生效（复用单表写管线）
+- **链式限制**：多表写与 `orderBy` / `limit` 互斥（构建器拦截，MySQL 同款）
+- 相关子查询在写入路径被拒绝；多表非事务写不原子（建议事务包裹，v2.3 起事务整体可崩溃回滚）
+
 ## TRUNCATE
 
 ```php
@@ -279,7 +316,7 @@ $db->commit();                                      // 提交；只剩 A
 |---|---|
 | 值类型非法、越界、超长、枚举外、日期格式错误 | `TypeException` |
 | 主键/唯一冲突、NOT NULL 违反、外键值不存在、FK 策略拦截、CHECK 违反、UPSERT 目标歧义 | `ConstraintException` |
-| 未知列、非法运算符/方向、负 limit、空表 MIN/MAX | `QueryException` |
+| 未知列、非法运算符/方向、负 limit | `QueryException` |
 | 表不存在、JSON 文件损坏、IO 失败、密钥错误或数据损坏（加密） | `StorageException` |
 | 表/库已存在或不存在（结构层）、非法表名列名 | `SchemaException` |
 | 事务误用 | `TransactionException` |

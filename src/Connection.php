@@ -19,7 +19,9 @@ use Kingbes\Psql\Schema\ColumnSchema;
 use Kingbes\Psql\Schema\TableIndex;
 use Kingbes\Psql\Schema\TableSchema;
 use Kingbes\Psql\Storage\EngineSnapshot;
+use Kingbes\Psql\Storage\LockingEngine;
 use Kingbes\Psql\Storage\StorageEngine;
+use Kingbes\Psql\Storage\WalEngine;
 use Kingbes\Psql\Type\ValueCaster;
 
 /**
@@ -49,7 +51,8 @@ final class Connection
 
     public function __construct(private StorageEngine $engine, string $database = 'main')
     {
-        // 数据库不存在则自动创建（保证连接后即可用）
+        // 崩溃恢复：上次有未提交事务崩溃则回滚（undo.snap 存在时自动恢复），再确保库存在
+        $this->walEngine()?->recoverIfNeeded();
         if (!$engine->hasDatabase($database)) {
             $engine->createDatabase($database);
         }
@@ -59,6 +62,50 @@ final class Connection
     public function engine(): StorageEngine
     {
         return $this->engine;
+    }
+
+    /**
+     * 并发模式下的 LockingEngine（否则 null）
+     */
+    private function concurrentEngine(): ?LockingEngine
+    {
+        return $this->engine instanceof LockingEngine ? $this->engine : null;
+    }
+
+    /**
+     * WAL 模式下的 WalEngine（否则 null）；wal + concurrency 组合时从 LockingEngine 内层取
+     */
+    private function walEngine(): ?WalEngine
+    {
+        if ($this->engine instanceof WalEngine) {
+            return $this->engine;
+        }
+        if ($this->engine instanceof LockingEngine) {
+            return $this->engine->innerWalEngine();
+        }
+
+        return null;
+    }
+
+    /**
+     * 读语句整段持共享锁执行（单 writer 多 reader：SELECT 全语句一致性）；
+     * 非并发模式直接执行
+     */
+    public function readLocked(callable $fn): mixed
+    {
+        $engine = $this->concurrentEngine();
+
+        return $engine === null ? $fn() : $engine->readLocked($fn);
+    }
+
+    /**
+     * 写语句整段持排他锁执行；非并发模式直接执行
+     */
+    public function writeLocked(callable $fn): mixed
+    {
+        $engine = $this->concurrentEngine();
+
+        return $engine === null ? $fn() : $engine->writeLocked($fn);
     }
 
     public function currentDatabase(): string
@@ -157,7 +204,7 @@ final class Connection
     }
 
     /**
-     * 删除表；不存在或被外键引用抛 SchemaException
+     * 删除表；不存在、被外键引用或被视图引用抛 SchemaException
      */
     public function dropTable(string $name): void
     {
@@ -165,6 +212,7 @@ final class Connection
             throw new SchemaException("表不存在: {$this->database}.{$name}");
         }
         $this->assertTableNotReferenced($name);
+        $this->assertTableNotUsedByView($name);
         $this->engine->dropTable($this->database, $name);
         $this->recordWrite();
     }
@@ -183,10 +231,20 @@ final class Connection
     }
 
     /**
-     * 委托引擎重命名（from 不存在/to 已存在由引擎抛 StorageException）
+     * 读取表结构；表不存在抛 StorageException
+     */
+    public function tableSchema(string $table): TableSchema
+    {
+        return $this->engine->loadSchema($this->database, $table);
+    }
+
+    /**
+     * 委托引擎重命名；from 不存在/to 已存在由引擎抛 StorageException；
+     * 被视图引用抛 SchemaException
      */
     public function renameTable(string $from, string $to): void
     {
+        $this->assertTableNotUsedByView($from);
         $this->engine->renameTable($this->database, $from, $to);
         $this->recordWrite();
     }
@@ -299,6 +357,18 @@ final class Connection
                 if ($foreignKey->refTable === $table) {
                     throw new SchemaException("表 {$table} 被表 {$name} 的外键引用，无法删除");
                 }
+            }
+        }
+    }
+
+    /**
+     * 检查表是否被当前库中任何视图引用；被引用抛 SchemaException（消息含视图名）
+     */
+    public function assertTableNotUsedByView(string $table): void
+    {
+        foreach ($this->engine->loadViewDefinitions($this->database) as $name => $data) {
+            if (ViewDefinition::fromArray($data)->usesTable($table)) {
+                throw new SchemaException("表 {$table} 被视图 {$name} 引用，无法删除或重命名");
             }
         }
     }
@@ -476,17 +546,54 @@ final class Connection
         return new Table($this, $match[1], $alias);
     }
 
+    /**
+     * 以子查询为 FROM 源（派生表）构建查询：`FROM (子查询) AS alias`
+     *
+     * 子查询构建器立即 toQuery 固化；别名必填（列引用与去歧义依赖它）
+     */
+    public function fromSub(SelectBuilder $query, string $alias): SelectBuilder
+    {
+        return SelectBuilder::fromSub($this, $query, $alias);
+    }
+
+    /**
+     * 注册 WITH CTE（非递归）并返回查询构建入口：`WITH cte AS (...) SELECT ...`
+     *
+     * FROM 位用 fromCte(name, alias) 引用、JOIN 位用 joinCte/leftJoinCte/rightJoinCte 引用；
+     * 后序 CTE 可引用前序 CTE；每次引用独立完整执行（非物化）
+     *
+     * @param array<string, SelectBuilder> $ctes 命名 CTE 定义
+     */
+    public function with(array $ctes): SelectBuilder
+    {
+        return SelectBuilder::withCtes($this, $ctes);
+    }
+
+    /**
+     * 以命名 CTE 为 FROM 源构建查询（解析延迟到所属 with 作用域固化时）：
+     * 用于 CTE 定义内部引用前序 CTE，如 `$db->with(['a' => ..., 'b' => $db->fromCte('a', 'x')->where(...)])`
+     */
+    public function fromCte(string $name, ?string $alias = null): SelectBuilder
+    {
+        return SelectBuilder::withCtes($this, [])->fromCte($name, $alias);
+    }
+
     // ---- 事务 ----
 
     /**
      * 开启事务：快照引擎全量状态；已在事务中抛 TransactionException
+     *
+     * 并发模式（LockingEngine）下从 begin 起全程持排他锁（阻塞等待当前 reader 释放），
+     * commit/rollBack 释放——事务级原子性；WAL 模式把快照原子写 undo.snap（崩溃时回滚未提交事务）
      */
     public function begin(): void
     {
         if ($this->transactionSnapshot !== null) {
             throw new TransactionException('已在事务中，无法重复开启');
         }
+        $this->concurrentEngine()?->holdExclusive();
         $this->transactionSnapshot = $this->engine->snapshot();
+        $this->walEngine()?->beginTransaction($this->transactionSnapshot);
     }
 
     /**
@@ -500,6 +607,8 @@ final class Connection
         $this->engine->persist();
         $this->transactionSnapshot = null;
         $this->savepoints = [];
+        $this->walEngine()?->commitTransaction();
+        $this->concurrentEngine()?->releaseExclusive();
     }
 
     /**
@@ -515,6 +624,8 @@ final class Connection
         $this->savepoints = [];
         // restore 改写了引擎数据，必须失效索引缓存（最关键的失效点）
         $this->recordWrite();
+        $this->walEngine()?->rollbackTransaction();
+        $this->concurrentEngine()?->releaseExclusive();
     }
 
     /**

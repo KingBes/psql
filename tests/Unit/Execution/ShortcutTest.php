@@ -112,9 +112,12 @@ final class ShortcutTest extends TestCase
 
         // 条件聚合
         $this->assertSame(2, $this->conn->table('users')->where('age', '>', 20)->count());
-        // 空集聚合：count=0、sum/avg=0.0（builder 侧归一）
+        // 空集聚合：count=0、sum/avg=null、min/max=null（对齐 MySQL）
         $this->assertSame(0, $this->conn->table('users')->where('age', '>', 999)->count());
-        $this->assertSame(0.0, $this->conn->table('users')->where('age', '>', 999)->sum('age'));
+        $this->assertNull($this->conn->table('users')->where('age', '>', 999)->sum('age'));
+        $this->assertNull($this->conn->table('users')->where('age', '>', 999)->avg('age'));
+        $this->assertNull($this->conn->table('users')->where('age', '>', 999)->min('age'));
+        $this->assertNull($this->conn->table('users')->where('age', '>', 999)->max('age'));
     }
 
     public function testBuilderUpdateAndDelete(): void
