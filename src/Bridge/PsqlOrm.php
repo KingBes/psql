@@ -54,8 +54,6 @@ class PsqlOrm extends ThinkOrmConnection
 
     private ?PsqlConnection $psql = null;
 
-    private ?string $psqlPath = null;
-
     /** @var array<string, mixed> */
     private array $psqlOptions = [];
 
@@ -100,7 +98,6 @@ class PsqlOrm extends ThinkOrmConnection
             throw new InvalidArgumentException('psql 连接必须配置 database 作为本地数据目录路径');
         }
 
-        $this->psqlPath = $path;
         $this->psqlOptions = $this->parsePsqlOptions($this->config);
         $this->psql = Psql::connect($path, $this->psqlOptions);
 
@@ -391,6 +388,8 @@ class PsqlOrm extends ThinkOrmConnection
     public function close()
     {
         $this->psql = null;
+
+        return $this;
     }
 
     /**

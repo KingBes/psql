@@ -6,3 +6,10 @@ parameters:
     treatPhpDocTypesAsCertain: false
     parallel:
         maximumNumberOfProcesses: 2
+    # 以下为可选框架（webman / ThinkPHP）集成，所依赖框架未列入 dev 依赖，
+    # 无法在静态分析中解析其符号，故排除。它们已由 tests/Bridge 的集成测试覆盖。
+    excludePaths:
+        - src/Bridge/Webman
+        - src/Service.php
+        - src/Install.php
+        - src/config
