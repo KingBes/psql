@@ -53,6 +53,7 @@ foreach ($rows as $row) {
 - **数据库编程**：视图（`createView`/`view`，结构化持久化、事务可回滚）、PHP 闭包触发器（BEFORE/AFTER × INSERT/UPDATE/DELETE 六钩子）、savepoint、`explain()` 静态计划分析
 - **迁移工具**：`Migration::diff($target, $current)` 生成 schema 迁移计划、`Migration::apply` 顺序执行（建表/删表/加删改列/索引；NOT NULL 改动降级为手工提示）
 - **可插拔存储引擎**：MemoryEngine（纯内存）、JsonFileEngine（可读文件）、PhpSerializeEngine（高性能文件）、PagedJsonEngine（分页增量 + 墓碑删除），可实现 `StorageEngine` 接口自定义；支持静态压缩与加密（gzip / AES-256-CBC + HMAC）及 `backup()` 完整备份
+- **MVC 框架集成**：通过 think-orm 驱动 `Kingbes\Psql\Bridge\PsqlOrm` 在 ThinkPHP / webman 中使用（`Db::name` / Model）。ThinkPHP 经 composer `extra.think` 自动注入连接、webman 经自带 `Install`/`Bootstrap` 安装即用，详见 [集成文档](docs/integration.md)
 - **异常驱动**：任何失败（类型不合法、约束冲突、IO 损坏、误用）一律抛异常，绝不静默吞错；全库 `declare(strict_types=1)`
 
 ## 环境要求
@@ -66,6 +67,10 @@ foreach ($rows as $row) {
 ```bash
 composer require kingbes/psql
 ```
+
+> 在 ThinkPHP / webman（think-orm）里开箱即用：ThinkPHP 装完自动注入 `config/psql.php`
+> 里的连接、webman 作为标准插件装完自动发布 `config/plugin/kingbes/psql/`（配置 + 启动引导），
+> 详见 [ThinkPHP / webman 集成](docs/integration.md)。
 
 ## 快速开始
 
@@ -98,6 +103,7 @@ echo $result->lastInsertId();   // 1
 | [查询（DQL）](docs/query.md) | WHERE/JOIN/聚合/排序/子查询/UNION/视图/EXPLAIN/结果集 |
 | [写入（DML）](docs/write.md) | INSERT/INSERT...SELECT/REPLACE/UPDATE/DELETE、约束行为、级联删除、触发器、savepoint |
 | [事务](docs/transactions.md) | 快照语义、DDL 回滚、savepoint、限制 |
+| [ThinkPHP / webman 集成](docs/integration.md) | 通过本包自带驱动的 think-orm 接入（ThinkPHP 直连、webman 用自带引导类，Db::name / Model） |
 | [架构与扩展](docs/architecture.md) | 分层设计、存储引擎、异常体系、自定义引擎 |
 | [路线图](docs/roadmap.md) | 迭代计划、与完整 SQL 的差距矩阵、技术债 |
 
@@ -107,12 +113,16 @@ echo $result->lastInsertId();   // 1
 src/
 ├── Psql.php                  # 门面：connect()/memory()
 ├── Connection.php            # 连接：库/表管理、事务、DML 入口
+├── Install.php               # webman 插件安装（发布 config/plugin/kingbes/psql 插件目录）
+├── Service.php               # ThinkPHP 服务（自动把 psql 连接注入 config/database.php）
 ├── Exception/                # 异常体系（六个具体异常）
 ├── Schema/                   # Blueprint 建表 DSL、TableSchema、外键定义
 ├── Type/                     # ValueCaster 值校验与规范化
 ├── Query/                    # Table/SelectBuilder 链式构建、条件树、Agg、视图定义、EXPLAIN
 ├── Execution/                # Writer 约束管线、Executor 查询流水线、IndexManager 索引、触发器
 ├── Result/                   # ResultSet、InsertResult
+├── Bridge/                   # 框架桥接：PsqlOrm（think-orm 驱动）+ Webman\Bootstrap（webman 引导）
+├── config/                   # 插件配置模板（ThinkPHP psql.php；webman plugin/kingbes/psql/）
 └── Storage/                  # StorageEngine 接口、Memory/JsonFile/PhpSerialize/PagedJson 引擎、目录锁
 ```
 

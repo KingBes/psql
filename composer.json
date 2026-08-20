@@ -1,10 +1,24 @@
 {
     "name": "kingbes/psql",
-    "description": "一个 php sql插件，实现sql本地化。",
+    "description": "纯 PHP 实现的本地 SQL 数据库引擎（无服务器、无扩展依赖）：MySQL 方言类型与约束、链式 OOP 查询、四种存储引擎、事务/savepoint、索引、视图/触发器、并发与 WAL 崩溃恢复。",
     "type": "library",
+    "keywords": [
+        "database",
+        "sql",
+        "mysql",
+        "sqlite",
+        "orm",
+        "query-builder",
+        "storage",
+        "persistence",
+        "local-database"
+    ],
     "license": "MIT",
     "require": {
         "php": ">=8.2"
+    },
+    "suggest": {
+        "topthink/think-orm": "使用 Bridge/PsqlOrm 在 ThinkPHP / webman（think-orm）中接入本引擎时所需"
     },
     "autoload": {
         "psr-4": {
@@ -13,13 +27,25 @@
     },
     "require-dev": {
         "phpunit/phpunit": "^11.5",
-        "phpstan/phpstan": "^2.2"
+        "phpstan/phpstan": "^2.2",
+        "topthink/think-orm": "^4.0"
     },
     "scripts": {
         "test": "phpunit",
         "analyse": "phpstan analyse --no-progress --memory-limit=1G",
         "bench": "php bench.php"
     },
-    "minimum-stability": "dev",
-    "prefer-stable": true
+    "config": {
+        "sort-packages": true
+    },
+    "extra": {
+        "think": {
+            "services": [
+                "Kingbes\\Psql\\Service"
+            ],
+            "config": {
+                "psql": "src/config/psql.php"
+            }
+        }
+    }
 }
